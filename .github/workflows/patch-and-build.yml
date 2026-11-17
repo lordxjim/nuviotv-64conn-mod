@@ -1,0 +1,176 @@
+name: Patch & Build (64-conn)
+
+# Applies nuviotv-64conn.patch to the official NuvioMedia/NuvioTV repository,
+# verifies the patch invariants, then builds and unit-tests the patched app.
+# Produces a downloadable fullDebug APK without maintaining a fork.
+#
+# Tested baselines (patch applies cleanly with git am --3way):
+#   - dev  @ 48d6449  (default branch tip, the patch's authored base)
+#   - main @ 7327eabf (release branch tip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'NuvioTV ref to patch (branch / commit / tag)'
+        required: false
+        default: 'dev'
+  push:
+    branches: ['**']
+    paths:
+      - 'nuviotv-64conn.patch'
+      - 'verify-patch.sh'
+      - '.github/workflows/patch-and-build.yml'
+  pull_request:
+    paths:
+      - 'nuviotv-64conn.patch'
+      - 'verify-patch.sh'
+      - '.github/workflows/patch-and-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-build-test:
+    name: Apply patch, verify, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
+        uses: actions/checkout@v4
+        with:
+          repository: NuvioMedia/NuvioTV
+          ref: ${{ inputs.upstream_ref || 'dev' }}
+          # Full history so `git am --3way` can find base blobs when the
+          # selected ref has drifted from the patch's authored base.
+          fetch-depth: 0
+
+      - name: Checkout mod repository (patch + verify script)
+        uses: actions/checkout@v4
+        with:
+          path: mod
+
+      - name: Apply 64-connection patch
+        run: |
+          git config user.name "patch-ci"
+          git config user.email "patch-ci@users.noreply.github.com"
+          git am --3way mod/nuviotv-64conn.patch
+          echo "Patched HEAD: $(git log --oneline -1)"
+
+      - name: Verify patch invariants
+        run: bash mod/verify-patch.sh
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Prepare local properties
+        run: |
+          touch local.properties
+          touch local.dev.properties
+
+      - name: Prepare CI signing config
+        run: |
+          keytool -genkeypair \
+            -v \
+            -keystore "$RUNNER_TEMP/ci-debug.jks" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      - name: Unit tests and fullDebug APK build
+        run: ./gradlew :app:testFullDebugUnitTest :app:assembleFullDebug --stacktrace
+
+      - name: Upload test reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          path: app/build/reports/tests/
+          archive: false
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload fullDebug APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: app/build/outputs/apk/full/debug/app-full-universal-debug.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  # Attribution only: when the patched job fails, run the identical build and
+  # test task set on the UNPATCHED upstream at the same ref.
+  #   baseline fails too  -> pre-existing upstream issue, not a patch regression
+  #   baseline passes     -> patch regression (or a conflict) — investigate
+  baseline-attribution:
+    name: Baseline comparison (unpatched)
+    needs: patch-build-test
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
+        uses: actions/checkout@v4
+        with:
+          repository: NuvioMedia/NuvioTV
+          ref: ${{ inputs.upstream_ref || 'dev' }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Prepare local properties
+        run: |
+          touch local.properties
+          touch local.dev.properties
+
+      - name: Prepare CI signing config
+        run: |
+          keytool -genkeypair \
+            -v \
+            -keystore "$RUNNER_TEMP/ci-debug.jks" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      - name: Baseline unit tests and build
+        run: ./gradlew :app:testFullDebugUnitTest :app:assembleFullDebug --stacktrace
+
+      - name: Upload baseline test reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          path: app/build/reports/tests/
+          archive: false
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,368 @@
+From 90667ea7807f809c4317e247451a3dbce03aa77d Mon Sep 17 00:00:00 2001
+From: Mod Author <mod@local>
+Date: Mon, 16 Nov 2026 07:46:09 +0000
+Subject: [PATCH] Raise parallel connection cap to 64 (native tier) with
+ capacity & memory guards
+
+Config chain: MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY=64 as single
+source of truth (read clamp, both write clamps, UI slider).
+Capacity: executor 32->80 core, connection pool idle 32->128,
+dispatcher 64/32->128/128 (defensive; sync calls bypass it).
+Memory: depth floor conn+1 (was forced 2x conn, overcommitting and
+crashing coerceIn at 64), engine-side chunk guard on the native tier.
+Retry: chunk budget 2->4 attempts, jittered 50-80ms pause.
+UA: honest versioned player identity on the playback chain (was
+desktop-Chrome string contradicting TLS fingerprint + Range behavior).
+429 fuse, Retry-After, warm session, eviction guard untouched.
+---
+ .../tv/data/local/PlayerSettingsDataStore.kt  | 10 +++--
+ .../player/NuvioExoPlayerPerformanceHelper.kt |  5 ++-
+ .../screens/player/ParallelRangeDataSource.kt | 33 ++++++++++-----
+ .../player/PlayerMediaSourceFactory.kt        | 42 ++++++++++++++++---
+ .../player/PlayerPlaybackNetworking.kt        | 12 ++++--
+ .../tv/ui/screens/settings/MemoryBudget.kt    | 27 ++++++++++--
+ .../settings/PlaybackBufferNetworkSettings.kt | 21 +++++++++-
+ app/src/main/res/values/strings.xml           |  2 +-
+ 8 files changed, 120 insertions(+), 32 deletions(-)
+
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index a7d8946..7fa4405 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -491,6 +491,10 @@ data class PlayerSettings(
+         const val DEFAULT_PARALLEL_CHUNK_SIZE_KB = 16 * 1024
+         const val MIN_PARALLEL_CONNECTION_COUNT = 2
+         const val MAX_PARALLEL_CONNECTION_COUNT = 4
++        // Upper bound when ExoPlayer Native Memory (performance mode) is active.
++        // Single source of truth for the read clamp, both write clamps and the UI slider;
++        // keep in sync with MemoryBudget.MAX_CONNECTIONS for the non-native tier.
++        const val MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 64
+         const val MIN_PARALLEL_CHUNK_SIZE_KB = 256
+         const val MAX_PARALLEL_CHUNK_SIZE_KB = 128 * 1024
+         const val DEFAULT_ENABLE_HTTP2 = false
+@@ -1202,7 +1206,7 @@ class PlayerSettingsDataStore @Inject constructor(
+                 parallelConnectionCount = run {
+                     val isNativeMemory = isNativeMemoryActive(prefs)
+                     val defaultConnectionCount = PlayerSettings.DEFAULT_PARALLEL_CONNECTION_COUNT
+-                    val maxConnectionCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++                    val maxConnectionCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+                     (prefs[parallelConnectionCountKey] ?: defaultConnectionCount).coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxConnectionCount)
+                 },
+                 parallelChunkSizeKb = run {
+@@ -2059,7 +2063,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     suspend fun setParallelConnectionCount(count: Int) {
+         store().edit { prefs ->
+             val isNativeMemory = isNativeMemoryActive(prefs)
+-            val maxCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++            val maxCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+             prefs[parallelConnectionCountKey] = count.coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxCount)
+         }
+     }
+@@ -2076,7 +2080,7 @@ class PlayerSettingsDataStore @Inject constructor(
+             useParallelConnections?.let { prefs[useParallelConnectionsKey] = it }
+             parallelConnectionCount?.let {
+                 val isNativeMemory = isNativeMemoryActive(prefs)
+-                val maxCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++                val maxCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+                 prefs[parallelConnectionCountKey] = it.coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxCount)
+             }
+             parallelChunkSizeKb?.let {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+index 11da937..54886d5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+@@ -62,8 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
+     const val DEFAULT_NUVIO_BACK_BUFFER_MS = 15_000
+     const val DEFAULT_NUVIO_INITIAL_BITRATE_ESTIMATE = 50_000_000L     // 50 Mbps
+     // Parallel chunk fetching keeps more sockets alive than the old cap of 8, which was evicting
+-    // live chunk connections mid playback and forcing cold reopens.
+-    const val NUVIO_SHARED_POOL_MAX_IDLE = 32
++    // live chunk connections mid playback and forcing cold reopens. Sized at 2x the 64-connection
++    // cap (aria2-aligned) so a full window returns its sockets to the pool instead of churning.
++    const val NUVIO_SHARED_POOL_MAX_IDLE = 128
+     private const val BACK_BUFFER_TARGET_SHARE_NUM = 1L
+     private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index b46d099..09d1393 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -75,6 +75,10 @@ internal class ParallelRangeDataSource(
+             override fun initialValue(): ByteArray = ByteArray(READ_BUFFER_SIZE)
+         }
+ 
++        // Core size covers the deepest legal window (64 connections -> 65 chunks) plus the
++        // session's in-flight headroom (+4) and reader escalations/probes. The unbounded
++        // queue means core is the real concurrency ceiling, so it must scale with the
++        // connection cap; idle threads die after 60s (allowCoreThreadTimeOut).
+         private val sharedExecutor: ExecutorService by lazy {
+             val threadFactory = ThreadFactory { runnable ->
+                 Thread(runnable, "parallel-ds-worker").apply {
+@@ -83,7 +87,7 @@ internal class ParallelRangeDataSource(
+                 }
+             }
+             ThreadPoolExecutor(
+-                32, 64, 60L, TimeUnit.SECONDS,
++                80, 160, 60L, TimeUnit.SECONDS,
+                 java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+                 threadFactory,
+                 ThreadPoolExecutor.DiscardPolicy()
+@@ -125,6 +129,13 @@ internal class ParallelRangeDataSource(
+         private const val RATE_LIMIT_MAX_BACKOFF_RETRIES = 3
+         private const val RATE_LIMIT_BACKOFF_BASE_MS = 500L
+ 
++        // Per-chunk retry budget for ordinary (non-rate-limited, non-stalled) failures.
++        // Two attempts was too thin at high concurrency: one lost race against a busy
++        // host plus one transient socket error abandoned the chunk and stalled the window.
++        private const val CHUNK_RETRY_BUDGET = 4
++        private const val CHUNK_RETRY_BASE_DELAY_MS = 50L
++        private const val CHUNK_RETRY_JITTER_MS = 30L
++
+         private const val RATE_LIMIT_BACKOFF_CYCLE_CAP_MS = 3_000L
+ 
+         private const val RATE_LIMIT_WAIT_HARD_CAP_MS = 15_000L
+@@ -1172,7 +1183,7 @@ internal class ParallelRangeDataSource(
+ 
+     private fun downloadChunk(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
+         var lastException: Exception? = null
+-        for (attempt in 0..1) {
++        for (attempt in 0 until CHUNK_RETRY_BUDGET) {
+ 
+             if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
+             try {
+@@ -1189,20 +1200,22 @@ internal class ParallelRangeDataSource(
+                 if (rlError != null) {
+                     return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError)
+                 }
+-                if (attempt == 0) {
++                if (attempt < CHUNK_RETRY_BUDGET - 1) {
+                     if (e.isTransientInterruption()) {
+-                        Log.d(TAG, "Chunk $chunkIndex interrupted during prefetch (attempt 1), retrying")
+-                        try {
+-                            Thread.sleep(50)
+-                        } catch (_: InterruptedException) {
+-                        }
++                        Log.d(TAG, "Chunk $chunkIndex interrupted during prefetch (attempt ${attempt + 1}), retrying")
+                     } else {
+-                        Log.w(TAG, "Chunk $chunkIndex download failed (attempt 1), retrying: ${e.message}")
++                        Log.w(TAG, "Chunk $chunkIndex download failed (attempt ${attempt + 1}/$CHUNK_RETRY_BUDGET), retrying: ${e.message}")
++                    }
++                    // Jittered pause: a fixed interval re-syncs workers that failed together
++                    // into a retry herd against the same host.
++                    try {
++                        Thread.sleep(CHUNK_RETRY_BASE_DELAY_MS + (Math.random() * CHUNK_RETRY_JITTER_MS).toLong())
++                    } catch (_: InterruptedException) {
+                     }
+                 }
+             }
+         }
+-        throw IOException("Failed to download chunk $chunkIndex after 2 attempts", lastException)
++        throw IOException("Failed to download chunk $chunkIndex after $CHUNK_RETRY_BUDGET attempts", lastException)
+     }
+ 
+     private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+index 9d91a89..4405f4b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+@@ -225,17 +225,40 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+         parallelStartupPrefetchUnlocked.set(!useChunkSessionSource)
+         val networkProgressiveFactory: DataSource.Factory = if (useChunkSessionSource) {
+             val sessionConnections = parallelConnectionCount
++            val effectiveNative =
++                nuvioPerformanceModeEnabled || NuvioEngineConfig.get().isNativeAllocationEnabled()
+             val okHttpFactory = OkHttpDataSource.Factory(playbackHttpClient).apply {
+                 setDefaultRequestProperties(sanitizedHeaders)
+                 if (sanitizedHeaders.none { it.key.equals("User-Agent", ignoreCase = true) }) {
+                     setUserAgent(DEFAULT_USER_AGENT)
+                 }
+             }
+-            val sessionChunkBytes = parallelChunkSizeKb
++            var sessionChunkBytes = parallelChunkSizeKb
+                 .coerceAtMost(com.nuvio.tv.ui.screens.settings.MemoryBudget.tierMaxChunkMb * 1024)
+                 .toLong() * 1024L
+-            val effectiveNative =
+-                nuvioPerformanceModeEnabled || NuvioEngineConfig.get().isNativeAllocationEnabled()
++            // Engine-side guard, native tier only (the tier where 64 connections and 128 MB
++            // chunks are reachable): the window floor plus in-flight headroom must fit the
++            // native buffer budget, whatever chunk size is stored. The settings UI already
++            // shrinks the chunk on this tier, but sync restores and direct DataStore writes
++            // skip that path, so clamp here too, at the last gate before buffers allocate.
++            // The non-native tier keeps the heap-budget coordination in the settings UI
++            // (MemoryBudget.maxChunkMb) and its 4-connection cap, so it is left untouched.
++            if (effectiveNative) {
++                val chunkBudgetMb = com.nuvio.tv.ui.screens.settings.MemoryBudget.safeChunkMbForConnections(
++                    sessionConnections,
++                    NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context) -
++                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
++                )
++                val chunkBudgetBytes = chunkBudgetMb.toLong() * 1024L * 1024L
++                if (chunkBudgetBytes < sessionChunkBytes) {
++                    Log.w(
++                        "PlayerMediaSource",
++                        "Chunk size ${sessionChunkBytes / 1024 / 1024}MB exceeds native budget for " +
++                            "$sessionConnections connections; clamped to ${chunkBudgetMb}MB"
++                    )
++                    sessionChunkBytes = chunkBudgetBytes
++                }
++            }
+             ParallelRangeDataSource.Factory(
+                 okHttpFactory,
+                 sessionConnections,
+@@ -437,9 +460,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+         private const val VOD_CACHE_TRIM_STEP_BYTES = 64L * 1024L * 1024L
+         private const val LOG_TAG = "PlayerMediaSource"
+         private const val AUTO_VOD_CACHE_FLOOR_BYTES = 2L * 1024L * 1024L * 1024L
+-        internal const val DEFAULT_USER_AGENT =
+-            "Mozilla/5.0 (Linux; Android 13; Android TV) AppleWebKit/537.36 " +
+-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++        // Honest, version-stamped player identity for the playback chain (probe, parallel
++        // chunk download, mpv, frame-rate probe, OpenSubtitles). Replaces the previous
++        // desktop-Chrome string: a browser self-description combined with an okhttp TLS
++        // fingerprint and parallel Range behavior is the classic "disguised downloader"
++        // anti-abuse signature, and it only draws scrutiny once connection counts go up.
++        // Scraping chains (YouTube extractor, subtitle timing) keep their own browser UA.
++        internal val DEFAULT_USER_AGENT =
++            "NuvioTV/" + com.nuvio.tv.BuildConfig.VERSION_NAME +
++                " (Linux; Android " + android.os.Build.VERSION.RELEASE + ") " +
++                "AndroidXMedia3/" + androidx.media3.common.MediaLibraryInfo.VERSION
+ 
+         private const val MIME_PROBE_CACHE_SIZE = 64
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+index ebc06ae..7a832dc 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+@@ -44,8 +44,11 @@ internal object PlayerPlaybackNetworking {
+      */
+     internal val trustAllPlaybackHttpClient: OkHttpClient by lazy {
+         val dispatcher = okhttp3.Dispatcher().apply {
+-            maxRequests = 64
+-            maxRequestsPerHost = 32
++            // OkHttpDataSource issues synchronous calls, which the dispatcher does not
++            // throttle; the limits only matter if a future media3/okhttp version switches
++            // to enqueue(). Sized for the 64-connection window plus bypass/probe margin.
++            maxRequests = 128
++            maxRequestsPerHost = 128
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+@@ -71,8 +74,9 @@ internal object PlayerPlaybackNetworking {
+      */
+     internal val playbackHttpClient: OkHttpClient by lazy {
+         val dispatcher = okhttp3.Dispatcher().apply {
+-            maxRequests = 64
+-            maxRequestsPerHost = 32
++            // See trustAllPlaybackHttpClient: sized for the 64-connection window plus margin.
++            maxRequests = 128
++            maxRequestsPerHost = 128
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+index 02fa22a..55436e4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+@@ -34,6 +34,10 @@ object MemoryBudget {
+     private const val PREFETCH_DEPTH_LOWER_MULTIPLE = 2
+     private const val PREFETCH_DEPTH_UPPER_MULTIPLE = 4
+ 
++    // In-flight chunk headroom above the window depth, mirroring the session chunk cap
++    // (depth + 2 low-RAM / + 4 otherwise); used by the engine-side chunk guard.
++    private const val IN_FLIGHT_CHUNK_HEADROOM = 4
++
+     const val MIN_CONNECTIONS = 2
+     const val MAX_CONNECTIONS = 4
+     const val MIN_CHUNK_MB = 8
+@@ -169,12 +173,27 @@ object MemoryBudget {
+         val chunkBudgetMb = (safeNativeLimitMb - reserveBufferMb.coerceAtLeast(0))
+             .coerceAtLeast(chunkMb * PREFETCH_DEPTH_LOWER_MULTIPLE)
+         val byBudget = chunkBudgetMb / chunkMb
+-        return byBudget.coerceIn(
+-            connections * PREFETCH_DEPTH_LOWER_MULTIPLE,
+-            connections * PREFETCH_DEPTH_UPPER_MULTIPLE
+-        )
++        // The window never drops below connections + 1 (the reader's own chunk must always be
++        // schedulable), and it only exceeds the budget's own chunk count when the connection
++        // count itself demands it. The old coerceIn(connections * 2, connections * 4) threw
++        // IllegalArgumentException whenever the budget could not fund 2 chunks per connection,
++        // which 64 connections reaches on every tier.
++        val byConnections = connections + 1
++        return byBudget.coerceIn(byConnections, byConnections * PREFETCH_DEPTH_UPPER_MULTIPLE)
+     }
+ 
++    /**
++     * Largest chunk size whose worst-case retained set still fits the buffer budget:
++     * (connections + 1 + in-flight headroom) buffers, mirroring the session chunk cap
++     * (depth + 2 low-RAM / + 4 otherwise) plus the reader's own chunk. Keeps the engine
++     * memory-bounded when the configured chunk would overcommit, e.g. 64 connections
++     * with 8-16 MB chunks on a 2 GB device. Floor is 1 MB: below that, lowering the
++     * connection count is the right lever, not smaller chunks.
++     */
++    fun safeChunkMbForConnections(connections: Int, bufferBudgetMb: Int): Int =
++        (bufferBudgetMb / (connections + IN_FLIGHT_CHUNK_HEADROOM + 1))
++            .coerceIn(1, MAX_CHUNK_MB)
++
+     /** Max chunk size that fits budget given current buffer size */
+     fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
+         ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+index d017af4..29b83db 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+@@ -345,6 +345,8 @@ private fun ParallelNetworkControls(
+     settings: PlayerSettings,
+     updateMemory: PlaybackSettingsUpdate
+ ) {
++    val context = LocalContext.current
++
+     SettingsToggleRow(
+         title = stringResource(R.string.playback_net_parallel),
+         subtitle = stringResource(R.string.playback_net_parallel_sub),
+@@ -359,13 +361,28 @@ private fun ParallelNetworkControls(
+             value = settings.parallelConnectionCount,
+             valueText = settings.parallelConnectionCount.toString(),
+             minValue = MemoryBudget.MIN_CONNECTIONS,
+-            maxValue = if (settings.nuvioPerformanceModeEnabled) 16 else MemoryBudget.MAX_CONNECTIONS,
++            maxValue = if (settings.nuvioPerformanceModeEnabled) {
++                PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY
++            } else {
++                MemoryBudget.MAX_CONNECTIONS
++            },
+             step = 1,
+             onValueChange = { count -> updateMemory { setParallelConnectionCount(count) } }
+         )
+ 
+         val maxChunkSizeMb = if (settings.nuvioPerformanceModeEnabled) {
+-            MemoryBudget.tierMaxChunkMb
++            // Mirror the engine-side budget guard (PlayerMediaSourceFactory) so the slider
++            // never offers a chunk size the engine would silently clamp at assembly time:
++            // window depth + in-flight headroom buffers must fit the native budget.
++            val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++            val reserveMb = NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
++            minOf(
++                MemoryBudget.tierMaxChunkMb,
++                MemoryBudget.safeChunkMbForConnections(
++                    settings.parallelConnectionCount,
++                    safeNativeMb - reserveMb
++                )
++            )
+         } else {
+             MemoryBudget.maxChunkMb(
+                 MemoryBudget.effectiveBufferMb(settings.bufferSettings.targetBufferSizeMb),
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 5906b59..c67b021 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3367,7 +3367,7 @@
+     <string name="playback_net_parallel">Parallel Connections</string>
+     <string name="playback_net_parallel_sub">Use multiple connections in parallel for fetching streams. Activate when you experience buffering although your download speed is definitely more than sufficient.</string>
+     <string name="playback_net_connection_count">Connection Count</string>
+-    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values increase memory usage and throughput but with diminishing returns.</string>
++    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values increase memory usage and throughput but with diminishing returns. Values above 16 need ExoPlayer Native Memory and may trigger rate limiting on strict servers.</string>
+     <string name="playback_net_chunk_size">Chunk Size</string>
+     <string name="playback_net_chunk_size_sub">Size of each download chunk per connection. Larger chunks reduce overhead but use more memory.</string>
+ 
+-- 
+2.47.3
+

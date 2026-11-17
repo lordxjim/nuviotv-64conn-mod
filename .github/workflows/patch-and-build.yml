@@ -303,5 +303,20 @@ jobs:
           name: test-results-baseline
           path: results/baseline
 
+      # Exit code is preserved (regressions still turn the job red); the
+      # verdict text is mirrored into the run summary so the outcome of the
+      # tolerated exit-code-1 test steps is visible at a glance.
       - name: Compare and decide
-        run: python3 compare-tests.py results/patched results/baseline
+        run: |
+          set +e
+          python3 compare-tests.py results/patched results/baseline > verdict.txt 2>&1
+          VERDICT=$?
+          set -e
+          cat verdict.txt
+          {
+            echo "## Test verdict (patched vs baseline)"
+            echo '```'
+            cat verdict.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $VERDICT

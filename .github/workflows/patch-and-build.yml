@@ -1,8 +1,18 @@
 name: Patch & Build (64-conn)
 
 # Applies nuviotv-64conn.patch to the official NuvioMedia/NuvioTV repository,
-# verifies the patch invariants, then builds and unit-tests the patched app.
-# Produces a downloadable fullDebug APK without maintaining a fork.
+# verifies the patch invariants, builds the APK, and unit-tests the patched
+# app AGAINST an unpatched baseline run of the same suite.
+#
+# Job map:
+#   patch-verify-build   apply + verify + assembleFullDebug -> APK artifact
+#   unit-tests-patched   full unit test suite on the patched tree (tolerant)
+#   unit-tests-baseline  full unit test suite on the unpatched tree (tolerant)
+#   test-verdict         compares failed-test sets; red ONLY on real
+#                        regressions (patch fails tests the baseline passes).
+#
+# Pre-existing upstream test failures fail on BOTH sides and are tolerated
+# (upstream's own CI only runs com.nuvio.tv.updater.* for the same reason).
 #
 # Tested baselines (patch applies cleanly with git am --3way):
 #   - dev  @ 48d6449  (default branch tip, the patch's authored base)
@@ -20,11 +30,13 @@ on:
     paths:
       - 'nuviotv-64conn.patch'
       - 'verify-patch.sh'
+      - 'compare-tests.py'
       - '.github/workflows/patch-and-build.yml'
   pull_request:
     paths:
       - 'nuviotv-64conn.patch'
       - 'verify-patch.sh'
+      - 'compare-tests.py'
       - '.github/workflows/patch-and-build.yml'
 
 permissions:
@@ -35,8 +47,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  patch-build-test:
-    name: Apply patch, verify, build, test
+  patch-verify-build:
+    name: Apply patch, verify, build APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
@@ -95,34 +107,125 @@ jobs:
             echo "NUVIO_RELEASE_STORE_PASSWORD=android"
           } >> "$GITHUB_ENV"
 
-      - name: Unit tests and fullDebug APK build
-        run: ./gradlew :app:testFullDebugUnitTest :app:assembleFullDebug --stacktrace
+      - name: Build fullDebug APK
+        run: ./gradlew :app:assembleFullDebug --stacktrace
 
-      - name: Upload test reports (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          path: app/build/reports/tests/
-          archive: false
-          if-no-files-found: warn
-          retention-days: 7
+      # Stamp the APK and artifact names with the OFFICIAL versionName from
+      # app/build.gradle.kts (identical to what an official build of the same
+      # ref reports in Settings) plus the upstream base commit, so every
+      # rerun shows which official release the APK is based on.
+      # HEAD is the patch commit; HEAD~1 is the pristine upstream ref.
+      - name: Stamp official version into artifact names
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo unknown)
+          fi
+          BASE_SHA=$(git rev-parse --short HEAD~1)
+          APK_BASE="NuvioTV-${VERSION_NAME}-64conn-${BASE_SHA}"
+          echo "APK_BASE=$APK_BASE" >> "$GITHUB_ENV"
+          mv app/build/outputs/apk/full/debug/app-full-universal-debug.apk \
+             "app/build/outputs/apk/full/debug/${APK_BASE}-full-universal-debug.apk"
+          {
+            echo "## Patched APK version stamp"
+            echo "- Official versionName: **${VERSION_NAME}**"
+            echo "- Upstream base: ${BASE_SHA} (ref: ${{ inputs.upstream_ref || 'dev' }})"
+            echo "- Artifact: \`${APK_BASE}-full-debug-apk\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload fullDebug APK
         uses: actions/upload-artifact@v7
         with:
-          path: app/build/outputs/apk/full/debug/app-full-universal-debug.apk
+          name: ${{ env.APK_BASE }}-full-debug-apk
+          path: app/build/outputs/apk/full/debug/${{ env.APK_BASE }}-full-universal-debug.apk
           archive: false
           if-no-files-found: error
           retention-days: 14
 
-  # Attribution only: when the patched job fails, run the identical build and
-  # test task set on the UNPATCHED upstream at the same ref.
-  #   baseline fails too  -> pre-existing upstream issue, not a patch regression
-  #   baseline passes     -> patch regression (or a conflict) — investigate
-  baseline-attribution:
-    name: Baseline comparison (unpatched)
-    needs: patch-build-test
-    if: failure()
+  unit-tests-patched:
+    name: Unit tests (patched)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
+        uses: actions/checkout@v4
+        with:
+          repository: NuvioMedia/NuvioTV
+          ref: ${{ inputs.upstream_ref || 'dev' }}
+          fetch-depth: 0
+
+      - name: Checkout mod repository (patch + verify script)
+        uses: actions/checkout@v4
+        with:
+          path: mod
+
+      - name: Apply 64-connection patch
+        run: |
+          git config user.name "patch-ci"
+          git config user.email "patch-ci@users.noreply.github.com"
+          git am --3way mod/nuviotv-64conn.patch
+
+      - name: Verify patch invariants
+        run: bash mod/verify-patch.sh
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Prepare local properties
+        run: |
+          touch local.properties
+          touch local.dev.properties
+
+      - name: Prepare CI signing config
+        run: |
+          keytool -genkeypair \
+            -v \
+            -keystore "$RUNNER_TEMP/ci-debug.jks" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      # Tolerant on purpose: the verdict job decides red/green by comparing
+      # against the baseline, so upstream's own failing tests do not mark the
+      # patch red by themselves.
+      - name: Run full unit test suite
+        continue-on-error: true
+        run: ./gradlew :app:testFullDebugUnitTest --stacktrace
+
+      - name: Upload test results (XML)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-patched
+          path: app/build/test-results/testFullDebugUnitTest/*.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload test reports (HTML)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-patched-html
+          path: app/build/reports/tests/testFullDebugUnitTest/
+          if-no-files-found: warn
+          retention-days: 7
+
+  unit-tests-baseline:
+    name: Unit tests (baseline, unpatched)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
@@ -163,14 +266,42 @@ jobs:
             echo "NUVIO_RELEASE_STORE_PASSWORD=android"
           } >> "$GITHUB_ENV"
 
-      - name: Baseline unit tests and build
-        run: ./gradlew :app:testFullDebugUnitTest :app:assembleFullDebug --stacktrace
+      # Same tolerance as the patched job: pre-existing upstream failures are
+      # compared, not fatal.
+      - name: Run full unit test suite (baseline)
+        continue-on-error: true
+        run: ./gradlew :app:testFullDebugUnitTest --stacktrace
 
-      - name: Upload baseline test reports (on failure)
-        if: failure()
+      - name: Upload test results (XML)
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          path: app/build/reports/tests/
-          archive: false
+          name: test-results-baseline
+          path: app/build/test-results/testFullDebugUnitTest/*.xml
           if-no-files-found: warn
           retention-days: 7
+
+  test-verdict:
+    name: Test verdict (patch vs baseline)
+    needs: [unit-tests-patched, unit-tests-baseline]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mod repository (compare script)
+        uses: actions/checkout@v4
+
+      - name: Download patched test results
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: test-results-patched
+          path: results/patched
+
+      - name: Download baseline test results
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: test-results-baseline
+          path: results/baseline
+
+      - name: Compare and decide
+        run: python3 compare-tests.py results/patched results/baseline

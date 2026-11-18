@@ -1,6 +1,6 @@
-From 90667ea7807f809c4317e247451a3dbce03aa77d Mon Sep 17 00:00:00 2001
-From: Mod Author <mod@local>
-Date: Mon, 16 Nov 2026 07:46:09 +0000
+From 14fe14833db6705e56c2f121b2c722238f6c39d8 Mon Sep 17 00:00:00 2001
+From: sim <sim@example.com>
+Date: Tue, 17 Nov 2026 15:05:03 +0000
 Subject: [PATCH] Raise parallel connection cap to 64 (native tier) with
  capacity & memory guards
 
@@ -14,19 +14,33 @@ Retry: chunk budget 2->4 attempts, jittered 50-80ms pause.
 UA: honest versioned player identity on the playback chain (was
 desktop-Chrome string contradicting TLS fingerprint + Range behavior).
 429 fuse, Retry-After, warm session, eviction guard untouched.
+
+Chunk-budget fix (nativeChunkBudgetMb): the guard, the prefetch depth
+and the UI chunk filter charged the whole allocator target as the
+reserve (safeNative - targetBufferSizeMb). In managed performance mode
+the target EQUALS the safe native limit, so the budget collapsed to 0:
+every connection count pinned to the guard's 1 MB floor (settings UI
+offered only 256 KB / 512 KB / 1 MB) and the depth check went inert at
+its c+1 floor. The window lives INSIDE the target (buildLoadControl
+subtracts it, streaming floored at MIN_BUFFER_MB), so the budget is
+min(target, safeNative) - MIN_BUFFER_MB via MemoryBudget.nativeChunkBudgetMb,
+wired at all three sites. Ledger tests pin the real RAM tiers
+(100/200/500/1000/1600/2000) in MemoryBudgetNativeChunkBudgetTest.
 ---
- .../tv/data/local/PlayerSettingsDataStore.kt  | 10 +++--
- .../player/NuvioExoPlayerPerformanceHelper.kt |  5 ++-
- .../screens/player/ParallelRangeDataSource.kt | 33 ++++++++++-----
- .../player/PlayerMediaSourceFactory.kt        | 42 ++++++++++++++++---
- .../player/PlayerPlaybackNetworking.kt        | 12 ++++--
- .../tv/ui/screens/settings/MemoryBudget.kt    | 27 ++++++++++--
- .../settings/PlaybackBufferNetworkSettings.kt | 21 +++++++++-
- app/src/main/res/values/strings.xml           |  2 +-
- 8 files changed, 120 insertions(+), 32 deletions(-)
+ .../tv/data/local/PlayerSettingsDataStore.kt  |  10 +-
+ .../player/NuvioExoPlayerPerformanceHelper.kt |   5 +-
+ .../screens/player/ParallelRangeDataSource.kt |  33 ++--
+ .../player/PlayerMediaSourceFactory.kt        |  61 ++++++-
+ .../player/PlayerPlaybackNetworking.kt        |  12 +-
+ .../tv/ui/screens/settings/MemoryBudget.kt    |  42 ++++-
+ .../settings/PlaybackBufferNetworkSettings.kt |  23 ++-
+ app/src/main/res/values/strings.xml           |   2 +-
+ .../MemoryBudgetNativeChunkBudgetTest.kt      | 165 ++++++++++++++++++
+ 9 files changed, 318 insertions(+), 35 deletions(-)
+ create mode 100644 app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
 
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
-index a7d8946..7fa4405 100644
+index a7d8946f..7fa4405c 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 @@ -491,6 +491,10 @@ data class PlayerSettings(
@@ -68,7 +82,7 @@ index a7d8946..7fa4405 100644
              }
              parallelChunkSizeKb?.let {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
-index 11da937..54886d5 100644
+index 11da9371..54886d5f 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 @@ -62,8 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
@@ -84,7 +98,7 @@ index 11da937..54886d5 100644
      private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index b46d099..09d1393 100644
+index b46d099d..09d13935 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 @@ -75,6 +75,10 @@ internal class ParallelRangeDataSource(
@@ -162,10 +176,30 @@ index b46d099..09d1393 100644
  
      private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-index 9d91a89..4405f4b 100644
+index 9d91a894..241baa78 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-@@ -225,17 +225,40 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+@@ -146,10 +146,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+     ): Int {
+         if (!nuvioPerformanceModeEnabled) return connections + 1
+         val chunkMb = (chunkBytes / (1024L * 1024L)).toInt().coerceAtLeast(1)
+-        val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
+-        val reserveMb = NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
++        // The window shares the allocator target with the streaming buffer (in managed mode
++        // the target IS the safe native limit), so depth budgets against that total with the
++        // streaming floor as the reserve — see MemoryBudget.nativeChunkBudgetMb. Charging the
++        // whole target as the reserve left the depth check inert at its c+1 floor.
++        val totalMb = minOf(
++            NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0),
++            NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++        )
+         return com.nuvio.tv.ui.screens.settings.MemoryBudget.prefetchDepthChunks(
+-            connections, chunkMb, safeNativeMb, reserveMb
++            connections, chunkMb, totalMb, com.nuvio.tv.ui.screens.settings.MemoryBudget.MIN_BUFFER_MB
+         )
+     }
+ 
+@@ -225,17 +231,47 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
          parallelStartupPrefetchUnlocked.set(!useChunkSessionSource)
          val networkProgressiveFactory: DataSource.Factory = if (useChunkSessionSource) {
              val sessionConnections = parallelConnectionCount
@@ -191,10 +225,17 @@ index 9d91a89..4405f4b 100644
 +            // The non-native tier keeps the heap-budget coordination in the settings UI
 +            // (MemoryBudget.maxChunkMb) and its 4-connection cap, so it is left untouched.
 +            if (effectiveNative) {
++                // Managed mode sets the target to the safe native limit itself, so the old
++                // safeNative - target reserve zeroed the budget and clamped every chunk to
++                // the guard's 1 MB floor. The window lives INSIDE the target (buildLoadControl
++                // subtracts it and floors the streaming side at MIN_BUFFER_MB), so the chunk
++                // budget is that total minus the streaming floor — nativeChunkBudgetMb.
 +                val chunkBudgetMb = com.nuvio.tv.ui.screens.settings.MemoryBudget.safeChunkMbForConnections(
 +                    sessionConnections,
-+                    NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context) -
-+                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
++                    com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
++                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                        NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++                    )
 +                )
 +                val chunkBudgetBytes = chunkBudgetMb.toLong() * 1024L * 1024L
 +                if (chunkBudgetBytes < sessionChunkBytes) {
@@ -209,7 +250,7 @@ index 9d91a89..4405f4b 100644
              ParallelRangeDataSource.Factory(
                  okHttpFactory,
                  sessionConnections,
-@@ -437,9 +460,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+@@ -437,9 +473,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
          private const val VOD_CACHE_TRIM_STEP_BYTES = 64L * 1024L * 1024L
          private const val LOG_TAG = "PlayerMediaSource"
          private const val AUTO_VOD_CACHE_FLOOR_BYTES = 2L * 1024L * 1024L * 1024L
@@ -230,7 +271,7 @@ index 9d91a89..4405f4b 100644
          private const val MIME_PROBE_CACHE_SIZE = 64
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-index ebc06ae..7a832dc 100644
+index ebc06ae3..7a832dc4 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 @@ -44,8 +44,11 @@ internal object PlayerPlaybackNetworking {
@@ -260,7 +301,7 @@ index ebc06ae..7a832dc 100644
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
-index 02fa22a..55436e4 100644
+index 02fa22a8..7230fb04 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 @@ -34,6 +34,10 @@ object MemoryBudget {
@@ -274,7 +315,7 @@ index 02fa22a..55436e4 100644
      const val MIN_CONNECTIONS = 2
      const val MAX_CONNECTIONS = 4
      const val MIN_CHUNK_MB = 8
-@@ -169,12 +173,27 @@ object MemoryBudget {
+@@ -169,12 +173,42 @@ object MemoryBudget {
          val chunkBudgetMb = (safeNativeLimitMb - reserveBufferMb.coerceAtLeast(0))
              .coerceAtLeast(chunkMb * PREFETCH_DEPTH_LOWER_MULTIPLE)
          val byBudget = chunkBudgetMb / chunkMb
@@ -303,11 +344,26 @@ index 02fa22a..55436e4 100644
 +        (bufferBudgetMb / (connections + IN_FLIGHT_CHUNK_HEADROOM + 1))
 +            .coerceIn(1, MAX_CHUNK_MB)
 +
++    /**
++     * Chunk-window budget on the native tier — single source for the engine-side guard
++     * (PlayerMediaSourceFactory), the prefetch depth and the settings-UI chunk filter.
++     *
++     * buildLoadControl() carves the parallel window out of the allocator target and floors
++     * the streaming remainder at [MIN_BUFFER_MB], so the window may spend everything above
++     * that floor. The previous wiring subtracted the whole target from the safe native
++     * limit; with the budget managed the target EQUALS that limit, so the chunk budget
++     * collapsed to zero and pinned every connection count to the guard's 1 MB floor. An
++     * override target above the safe limit buys streaming headroom only, never window
++     * headroom, hence the min().
++     */
++    fun nativeChunkBudgetMb(targetBufferMb: Int, safeNativeLimitMb: Int): Int =
++        (minOf(targetBufferMb, safeNativeLimitMb) - MIN_BUFFER_MB).coerceAtLeast(0)
++
      /** Max chunk size that fits budget given current buffer size */
      fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
          ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
-index d017af4..29b83db 100644
+index d017af43..6395de08 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 @@ -345,6 +345,8 @@ private fun ParallelNetworkControls(
@@ -319,7 +375,7 @@ index d017af4..29b83db 100644
      SettingsToggleRow(
          title = stringResource(R.string.playback_net_parallel),
          subtitle = stringResource(R.string.playback_net_parallel_sub),
-@@ -359,13 +361,28 @@ private fun ParallelNetworkControls(
+@@ -359,13 +361,30 @@ private fun ParallelNetworkControls(
              value = settings.parallelConnectionCount,
              valueText = settings.parallelConnectionCount.toString(),
              minValue = MemoryBudget.MIN_CONNECTIONS,
@@ -339,19 +395,21 @@ index d017af4..29b83db 100644
 +            // never offers a chunk size the engine would silently clamp at assembly time:
 +            // window depth + in-flight headroom buffers must fit the native budget.
 +            val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
-+            val reserveMb = NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
 +            minOf(
 +                MemoryBudget.tierMaxChunkMb,
 +                MemoryBudget.safeChunkMbForConnections(
 +                    settings.parallelConnectionCount,
-+                    safeNativeMb - reserveMb
++                    MemoryBudget.nativeChunkBudgetMb(
++                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                        safeNativeMb
++                    )
 +                )
 +            )
          } else {
              MemoryBudget.maxChunkMb(
                  MemoryBudget.effectiveBufferMb(settings.bufferSettings.targetBufferSizeMb),
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 5906b59..c67b021 100644
+index 5906b595..c67b021b 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -3367,7 +3367,7 @@
@@ -363,6 +421,177 @@ index 5906b59..c67b021 100644
      <string name="playback_net_chunk_size">Chunk Size</string>
      <string name="playback_net_chunk_size_sub">Size of each download chunk per connection. Larger chunks reduce overhead but use more memory.</string>
  
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
+new file mode 100644
+index 00000000..d583163b
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
+@@ -0,0 +1,165 @@
++@file:OptIn(UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Ledger tests for the native-tier chunk budget, pinned to the REAL device RAM
++ * tiers of NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb()
++ * (100 / 200 / 200 / 500 / 1000 / 1600 / 2000 MB) and to the reserve semantics
++ * of MemoryBudget.nativeChunkBudgetMb (streaming floor MIN_BUFFER_MB, not the
++ * managed target itself).
++ *
++ * Regression background: the previous wiring charged the whole allocator target
++ * as the reserve (safeNative - targetBufferSizeMb). In managed performance mode
++ * the target EQUALS the safe native limit, so the chunk budget collapsed to
++ * zero, the guard pinned every connection count to its 1 MB floor (settings UI
++ * offered only 256 KB / 512 KB / 1 MB) and the prefetch depth check went inert
++ * at its c+1 floor.
++ */
++@OptIn(UnstableApi::class)
++class MemoryBudgetNativeChunkBudgetTest {
++
++    // Real safe-native tiers by RAM band: <=1.15GB→100, <1.45GB→200, <2.3GB→200,
++    // <3.2GB→500, <4.8GB→1000, <6.8GB→1600, else→2000.
++    private val realTiers = intArrayOf(100, 200, 500, 1000, 1600, 2000)
++
++    @Test
++    fun testNativeChunkBudgetManagedModeIsNeverZero() {
++        // Managed mode: target == safe limit. The old wiring (safeNative - target)
++        // returned 0 here for EVERY tier; the budget is now the total minus the
++        // streaming floor (MIN_BUFFER_MB = 25).
++        realTiers.forEach { tier ->
++            assertEquals(tier - 25, MemoryBudget.nativeChunkBudgetMb(tier, tier))
++        }
++    }
++
++    @Test
++    fun testNativeChunkBudgetCustomTargetBelowLimit() {
++        // Custom (non-managed) target: the window must fit inside what the user
++        // actually granted, not the device ceiling.
++        assertEquals(75, MemoryBudget.nativeChunkBudgetMb(100, 1000))
++        assertEquals(25, MemoryBudget.nativeChunkBudgetMb(50, 200))
++    }
++
++    @Test
++    fun testNativeChunkBudgetOverrideCappedBySafeLimit() {
++        // Large-target-buffer override may raise the target above the safe limit;
++        // the extra buys streaming headroom only, never window headroom.
++        assertEquals(175, MemoryBudget.nativeChunkBudgetMb(2048, 200))
++        assertEquals(975, MemoryBudget.nativeChunkBudgetMb(2048, 1000))
++    }
++
++    @Test
++    fun testNativeChunkBudgetFloorZero() {
++        assertEquals(0, MemoryBudget.nativeChunkBudgetMb(10, 200))
++        assertEquals(0, MemoryBudget.nativeChunkBudgetMb(25, 2000))
++    }
++
++    @Test
++    fun testSafeChunkScalingOnTwoGbTier() {
++        // 2 GB-class TV (RAM < 2.3 GB -> safeNative 200), managed mode.
++        val budget = MemoryBudget.nativeChunkBudgetMb(200, 200) // 175
++        assertEquals(25, MemoryBudget.safeChunkMbForConnections(2, budget))
++        assertEquals(13, MemoryBudget.safeChunkMbForConnections(8, budget))
++        assertEquals(8, MemoryBudget.safeChunkMbForConnections(16, budget))
++        assertEquals(4, MemoryBudget.safeChunkMbForConnections(32, budget))
++        assertEquals(2, MemoryBudget.safeChunkMbForConnections(64, budget))
++    }
++
++    @Test
++    fun testUiFilterCapOnTwoGbTier() {
++        // The exact user-reported scenario: 2 GB-class TV, performance mode,
++        // 64 connections. Old wiring: budget 0 -> cap 1 MB -> only 256 KB /
++        // 512 KB / 1 MB offered. Fixed wiring: cap 2 MB (256 KB ... 2 MB).
++        val uiCap64 = minOf(
++            16, // MemoryBudget.tierMaxChunkMb on the low-RAM tier
++            MemoryBudget.safeChunkMbForConnections(
++                64,
++                MemoryBudget.nativeChunkBudgetMb(200, 200)
++            )
++        )
++        assertEquals(2, uiCap64)
++        // And at 16 connections the slider reaches 8 MB again.
++        val uiCap16 = minOf(
++            16,
++            MemoryBudget.safeChunkMbForConnections(
++                16,
++                MemoryBudget.nativeChunkBudgetMb(200, 200)
++            )
++        )
++        assertEquals(8, uiCap16)
++    }
++
++    @Test
++    fun testSafeChunkAcrossAllRealTiers() {
++        // Integer-division ledger per tier (budget = tier - 25, divisor = c + 5).
++        val expected = mapOf(
++            100 to intArrayOf(10, 5, 3, 2, 1),    // budget 75:  75/7, /13, /21, /37, /69
++            200 to intArrayOf(25, 13, 8, 4, 2),   // budget 175
++            500 to intArrayOf(67, 36, 22, 12, 6), // budget 475
++            1000 to intArrayOf(128, 75, 46, 26, 14),  // budget 975 (975/7=139 capped at 128)
++            1600 to intArrayOf(128, 121, 75, 42, 22), // budget 1575 (1575/7=225 capped at 128)
++            2000 to intArrayOf(128, 128, 94, 53, 28), // budget 1975, capped at MAX_CHUNK_MB
++        )
++        val conns = intArrayOf(2, 8, 16, 32, 64)
++        expected.forEach { (tier, caps) ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            conns.forEachIndexed { i, c ->
++                assertEquals("tier=$tier conn=$c", caps[i].toLong(),
++                    MemoryBudget.safeChunkMbForConnections(c, budget).toLong())
++            }
++        }
++    }
++
++    @Test
++    fun testWorstCaseRetainedSetFitsBudget() {
++        // safeChunk = budget / (c + 1 + 4), so the worst-case retained set
++        // (window floor + in-flight headroom) always fits the budget exactly.
++        realTiers.forEach { tier ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            intArrayOf(2, 8, 16, 32, 64).forEach { c ->
++                val chunk = MemoryBudget.safeChunkMbForConnections(c, budget)
++                assertTrue("tier=$tier conn=$c", (c + 5) * chunk <= budget)
++            }
++        }
++    }
++
++    @Test
++    fun testPrefetchDepthBudgetActiveAfterFix() {
++        // 2 GB-class TV, managed mode (total 200, reserve 25 -> 175 MB budget):
++        // the depth check is no longer inert at the c+1 floor.
++        assertEquals(175, MemoryBudget.prefetchDepthChunks(64, 1, 200, 25)) // 175/1 = 175
++        assertEquals(87, MemoryBudget.prefetchDepthChunks(64, 2, 200, 25))  // 175/2 = 87
++        assertEquals(21, MemoryBudget.prefetchDepthChunks(16, 8, 200, 25))  // 175/8 = 21
++        // Crash safety on a starving budget: floors at c+1 instead of throwing
++        // (the old coerceIn(c*2, c*4) threw IllegalArgumentException here).
++        assertEquals(65, MemoryBudget.prefetchDepthChunks(64, 1, 30, 25))   // budget 5 -> floor
++    }
++
++    @Test
++    fun testDepthTimesChunkWithinBudgetWhenFunded() {
++        // Whenever the budget funds at least the c+1 floor, depth x chunk stays
++        // within the chunk budget on every real tier.
++        realTiers.forEach { tier ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            intArrayOf(2, 8, 16, 32, 64).forEach { c ->
++                val chunk = MemoryBudget.safeChunkMbForConnections(c, budget)
++                val depth = MemoryBudget.prefetchDepthChunks(c, chunk, tier, 25)
++                val byBudget = budget / chunk.coerceAtLeast(1)
++                if (byBudget >= c + 1) {
++                    assertTrue("tier=$tier conn=$c", depth * chunk <= budget)
++                }
++                assertTrue(depth >= c + 1)
++                // The real upper bound is 4 * (c + 1): the multiplier applies to the
++                // window floor byConnections = c + 1, not to c.
++                assertTrue(depth <= 4 * (c + 1))
++            }
++        }
++    }
++}
 -- 
 2.47.3
 

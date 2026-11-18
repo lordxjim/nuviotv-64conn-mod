@@ -9,8 +9,9 @@
 set -u
 
 fail=0
+pass=0
 
-ok()   { printf '  [ok]    %s\n' "$1"; }
+ok()   { printf '  [ok]    %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf '  [FAIL]  %s (%s)\n' "$1" "$2"; fail=1; }
 
 # present <name> <extended-regex> <file>
@@ -32,6 +33,7 @@ PN="app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 PH="app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt"
 ST="app/src/main/res/values/strings.xml"
 YT="app/src/main/java/com/nuvio/tv/data/trailer/InAppYouTubeExtractor.kt"
+TS="app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt"
 
 echo "== Domain 1: parallel connection config chain =="
 present "MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 64 declared" \
@@ -51,12 +53,30 @@ present "depth floor lowered to connections + 1" \
   'byConnections = connections \+ 1' "$MB"
 present "safeChunkMbForConnections helper declared" \
   'fun safeChunkMbForConnections' "$MB"
+present "nativeChunkBudgetMb helper declared (single budget source)" \
+  'fun nativeChunkBudgetMb' "$MB"
 present "engine-side chunk guard wired in factory" \
   'safeChunkMbForConnections\(' "$MF"
+present "engine guard budgets via nativeChunkBudgetMb" \
+  'MemoryBudget\.nativeChunkBudgetMb\(' "$MF"
+absent "old full-target reserve removed (engine guard/depth)" \
+  'val reserveMb = NuvioExoPlayerPerformanceHelper\.targetBufferSizeMb' "$MF"
+present "depth reserve is the streaming floor (MIN_BUFFER_MB)" \
+  'MemoryBudget\.MIN_BUFFER_MB' "$MF"
 present "guard logs when it clamps" \
   'exceeds native budget for' "$MF"
 present "UI perf-mode chunk filter mirrors the guard" \
   'safeChunkMbForConnections\(' "$UI"
+present "UI chunk filter budgets via nativeChunkBudgetMb" \
+  'MemoryBudget\.nativeChunkBudgetMb\(' "$UI"
+absent "old safeNative-minus-reserve wiring removed (UI)" \
+  'safeNativeMb - reserveMb' "$UI"
+present "ledger test pins the real RAM tiers (100/200/500/1000/1600/2000)" \
+  'realTiers = intArrayOf\(100, 200, 500, 1000, 1600, 2000\)' "$TS"
+present "managed-mode zero-budget regression test present" \
+  'testNativeChunkBudgetManagedModeIsNeverZero' "$TS"
+present "worst-case retained-set invariant test present" \
+  'testWorstCaseRetainedSetFitsBudget' "$TS"
 present "429 fuse: depth halving entry point intact" \
   'beginRateLimitEpisode' "$PD"
 present "429 fuse: hard wait cap 15s intact" \
@@ -96,7 +116,7 @@ present "scraping chain keeps browser UA (YouTube extractor)" \
 
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "RESULT: all patch invariants verified"
+  echo "RESULT: all $pass patch invariants verified"
   exit 0
 else
   echo "RESULT: patch invariants BROKEN — do not build"

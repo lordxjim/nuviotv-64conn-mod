@@ -1,0 +1,2052 @@
+From 14fe14833db6705e56c2f121b2c722238f6c39d8 Mon Sep 17 00:00:00 2001
+From: sim <sim@example.com>
+Date: Tue, 17 Nov 2026 15:05:03 +0000
+Subject: [PATCH 1/6] Raise parallel connection cap to 64 (native tier) with
+ capacity & memory guards
+
+Config chain: MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY=64 as single
+source of truth (read clamp, both write clamps, UI slider).
+Capacity: executor 32->80 core, connection pool idle 32->128,
+dispatcher 64/32->128/128 (defensive; sync calls bypass it).
+Memory: depth floor conn+1 (was forced 2x conn, overcommitting and
+crashing coerceIn at 64), engine-side chunk guard on the native tier.
+Retry: chunk budget 2->4 attempts, jittered 50-80ms pause.
+UA: honest versioned player identity on the playback chain (was
+desktop-Chrome string contradicting TLS fingerprint + Range behavior).
+429 fuse, Retry-After, warm session, eviction guard untouched.
+
+Chunk-budget fix (nativeChunkBudgetMb): the guard, the prefetch depth
+and the UI chunk filter charged the whole allocator target as the
+reserve (safeNative - targetBufferSizeMb). In managed performance mode
+the target EQUALS the safe native limit, so the budget collapsed to 0:
+every connection count pinned to the guard's 1 MB floor (settings UI
+offered only 256 KB / 512 KB / 1 MB) and the depth check went inert at
+its c+1 floor. The window lives INSIDE the target (buildLoadControl
+subtracts it, streaming floored at MIN_BUFFER_MB), so the budget is
+min(target, safeNative) - MIN_BUFFER_MB via MemoryBudget.nativeChunkBudgetMb,
+wired at all three sites. Ledger tests pin the real RAM tiers
+(100/200/500/1000/1600/2000) in MemoryBudgetNativeChunkBudgetTest.
+---
+ .../tv/data/local/PlayerSettingsDataStore.kt  |  10 +-
+ .../player/NuvioExoPlayerPerformanceHelper.kt |   5 +-
+ .../screens/player/ParallelRangeDataSource.kt |  33 ++--
+ .../player/PlayerMediaSourceFactory.kt        |  61 ++++++-
+ .../player/PlayerPlaybackNetworking.kt        |  12 +-
+ .../tv/ui/screens/settings/MemoryBudget.kt    |  42 ++++-
+ .../settings/PlaybackBufferNetworkSettings.kt |  23 ++-
+ app/src/main/res/values/strings.xml           |   2 +-
+ .../MemoryBudgetNativeChunkBudgetTest.kt      | 165 ++++++++++++++++++
+ 9 files changed, 318 insertions(+), 35 deletions(-)
+ create mode 100644 app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
+
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index a7d8946f..7fa4405c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -491,6 +491,10 @@ data class PlayerSettings(
+         const val DEFAULT_PARALLEL_CHUNK_SIZE_KB = 16 * 1024
+         const val MIN_PARALLEL_CONNECTION_COUNT = 2
+         const val MAX_PARALLEL_CONNECTION_COUNT = 4
++        // Upper bound when ExoPlayer Native Memory (performance mode) is active.
++        // Single source of truth for the read clamp, both write clamps and the UI slider;
++        // keep in sync with MemoryBudget.MAX_CONNECTIONS for the non-native tier.
++        const val MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 64
+         const val MIN_PARALLEL_CHUNK_SIZE_KB = 256
+         const val MAX_PARALLEL_CHUNK_SIZE_KB = 128 * 1024
+         const val DEFAULT_ENABLE_HTTP2 = false
+@@ -1202,7 +1206,7 @@ class PlayerSettingsDataStore @Inject constructor(
+                 parallelConnectionCount = run {
+                     val isNativeMemory = isNativeMemoryActive(prefs)
+                     val defaultConnectionCount = PlayerSettings.DEFAULT_PARALLEL_CONNECTION_COUNT
+-                    val maxConnectionCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++                    val maxConnectionCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+                     (prefs[parallelConnectionCountKey] ?: defaultConnectionCount).coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxConnectionCount)
+                 },
+                 parallelChunkSizeKb = run {
+@@ -2059,7 +2063,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     suspend fun setParallelConnectionCount(count: Int) {
+         store().edit { prefs ->
+             val isNativeMemory = isNativeMemoryActive(prefs)
+-            val maxCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++            val maxCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+             prefs[parallelConnectionCountKey] = count.coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxCount)
+         }
+     }
+@@ -2076,7 +2080,7 @@ class PlayerSettingsDataStore @Inject constructor(
+             useParallelConnections?.let { prefs[useParallelConnectionsKey] = it }
+             parallelConnectionCount?.let {
+                 val isNativeMemory = isNativeMemoryActive(prefs)
+-                val maxCount = if (isNativeMemory) 16 else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
++                val maxCount = if (isNativeMemory) PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY else PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT
+                 prefs[parallelConnectionCountKey] = it.coerceIn(PlayerSettings.MIN_PARALLEL_CONNECTION_COUNT, maxCount)
+             }
+             parallelChunkSizeKb?.let {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+index 11da9371..54886d5f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+@@ -62,8 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
+     const val DEFAULT_NUVIO_BACK_BUFFER_MS = 15_000
+     const val DEFAULT_NUVIO_INITIAL_BITRATE_ESTIMATE = 50_000_000L     // 50 Mbps
+     // Parallel chunk fetching keeps more sockets alive than the old cap of 8, which was evicting
+-    // live chunk connections mid playback and forcing cold reopens.
+-    const val NUVIO_SHARED_POOL_MAX_IDLE = 32
++    // live chunk connections mid playback and forcing cold reopens. Sized at 2x the 64-connection
++    // cap (aria2-aligned) so a full window returns its sockets to the pool instead of churning.
++    const val NUVIO_SHARED_POOL_MAX_IDLE = 128
+     private const val BACK_BUFFER_TARGET_SHARE_NUM = 1L
+     private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index b46d099d..09d13935 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -75,6 +75,10 @@ internal class ParallelRangeDataSource(
+             override fun initialValue(): ByteArray = ByteArray(READ_BUFFER_SIZE)
+         }
+ 
++        // Core size covers the deepest legal window (64 connections -> 65 chunks) plus the
++        // session's in-flight headroom (+4) and reader escalations/probes. The unbounded
++        // queue means core is the real concurrency ceiling, so it must scale with the
++        // connection cap; idle threads die after 60s (allowCoreThreadTimeOut).
+         private val sharedExecutor: ExecutorService by lazy {
+             val threadFactory = ThreadFactory { runnable ->
+                 Thread(runnable, "parallel-ds-worker").apply {
+@@ -83,7 +87,7 @@ internal class ParallelRangeDataSource(
+                 }
+             }
+             ThreadPoolExecutor(
+-                32, 64, 60L, TimeUnit.SECONDS,
++                80, 160, 60L, TimeUnit.SECONDS,
+                 java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+                 threadFactory,
+                 ThreadPoolExecutor.DiscardPolicy()
+@@ -125,6 +129,13 @@ internal class ParallelRangeDataSource(
+         private const val RATE_LIMIT_MAX_BACKOFF_RETRIES = 3
+         private const val RATE_LIMIT_BACKOFF_BASE_MS = 500L
+ 
++        // Per-chunk retry budget for ordinary (non-rate-limited, non-stalled) failures.
++        // Two attempts was too thin at high concurrency: one lost race against a busy
++        // host plus one transient socket error abandoned the chunk and stalled the window.
++        private const val CHUNK_RETRY_BUDGET = 4
++        private const val CHUNK_RETRY_BASE_DELAY_MS = 50L
++        private const val CHUNK_RETRY_JITTER_MS = 30L
++
+         private const val RATE_LIMIT_BACKOFF_CYCLE_CAP_MS = 3_000L
+ 
+         private const val RATE_LIMIT_WAIT_HARD_CAP_MS = 15_000L
+@@ -1172,7 +1183,7 @@ internal class ParallelRangeDataSource(
+ 
+     private fun downloadChunk(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
+         var lastException: Exception? = null
+-        for (attempt in 0..1) {
++        for (attempt in 0 until CHUNK_RETRY_BUDGET) {
+ 
+             if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
+             try {
+@@ -1189,20 +1200,22 @@ internal class ParallelRangeDataSource(
+                 if (rlError != null) {
+                     return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError)
+                 }
+-                if (attempt == 0) {
++                if (attempt < CHUNK_RETRY_BUDGET - 1) {
+                     if (e.isTransientInterruption()) {
+-                        Log.d(TAG, "Chunk $chunkIndex interrupted during prefetch (attempt 1), retrying")
+-                        try {
+-                            Thread.sleep(50)
+-                        } catch (_: InterruptedException) {
+-                        }
++                        Log.d(TAG, "Chunk $chunkIndex interrupted during prefetch (attempt ${attempt + 1}), retrying")
+                     } else {
+-                        Log.w(TAG, "Chunk $chunkIndex download failed (attempt 1), retrying: ${e.message}")
++                        Log.w(TAG, "Chunk $chunkIndex download failed (attempt ${attempt + 1}/$CHUNK_RETRY_BUDGET), retrying: ${e.message}")
++                    }
++                    // Jittered pause: a fixed interval re-syncs workers that failed together
++                    // into a retry herd against the same host.
++                    try {
++                        Thread.sleep(CHUNK_RETRY_BASE_DELAY_MS + (Math.random() * CHUNK_RETRY_JITTER_MS).toLong())
++                    } catch (_: InterruptedException) {
+                     }
+                 }
+             }
+         }
+-        throw IOException("Failed to download chunk $chunkIndex after 2 attempts", lastException)
++        throw IOException("Failed to download chunk $chunkIndex after $CHUNK_RETRY_BUDGET attempts", lastException)
+     }
+ 
+     private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+index 9d91a894..241baa78 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+@@ -146,10 +146,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+     ): Int {
+         if (!nuvioPerformanceModeEnabled) return connections + 1
+         val chunkMb = (chunkBytes / (1024L * 1024L)).toInt().coerceAtLeast(1)
+-        val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
+-        val reserveMb = NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0)
++        // The window shares the allocator target with the streaming buffer (in managed mode
++        // the target IS the safe native limit), so depth budgets against that total with the
++        // streaming floor as the reserve — see MemoryBudget.nativeChunkBudgetMb. Charging the
++        // whole target as the reserve left the depth check inert at its c+1 floor.
++        val totalMb = minOf(
++            NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0),
++            NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++        )
+         return com.nuvio.tv.ui.screens.settings.MemoryBudget.prefetchDepthChunks(
+-            connections, chunkMb, safeNativeMb, reserveMb
++            connections, chunkMb, totalMb, com.nuvio.tv.ui.screens.settings.MemoryBudget.MIN_BUFFER_MB
+         )
+     }
+ 
+@@ -225,17 +231,47 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+         parallelStartupPrefetchUnlocked.set(!useChunkSessionSource)
+         val networkProgressiveFactory: DataSource.Factory = if (useChunkSessionSource) {
+             val sessionConnections = parallelConnectionCount
++            val effectiveNative =
++                nuvioPerformanceModeEnabled || NuvioEngineConfig.get().isNativeAllocationEnabled()
+             val okHttpFactory = OkHttpDataSource.Factory(playbackHttpClient).apply {
+                 setDefaultRequestProperties(sanitizedHeaders)
+                 if (sanitizedHeaders.none { it.key.equals("User-Agent", ignoreCase = true) }) {
+                     setUserAgent(DEFAULT_USER_AGENT)
+                 }
+             }
+-            val sessionChunkBytes = parallelChunkSizeKb
++            var sessionChunkBytes = parallelChunkSizeKb
+                 .coerceAtMost(com.nuvio.tv.ui.screens.settings.MemoryBudget.tierMaxChunkMb * 1024)
+                 .toLong() * 1024L
+-            val effectiveNative =
+-                nuvioPerformanceModeEnabled || NuvioEngineConfig.get().isNativeAllocationEnabled()
++            // Engine-side guard, native tier only (the tier where 64 connections and 128 MB
++            // chunks are reachable): the window floor plus in-flight headroom must fit the
++            // native buffer budget, whatever chunk size is stored. The settings UI already
++            // shrinks the chunk on this tier, but sync restores and direct DataStore writes
++            // skip that path, so clamp here too, at the last gate before buffers allocate.
++            // The non-native tier keeps the heap-budget coordination in the settings UI
++            // (MemoryBudget.maxChunkMb) and its 4-connection cap, so it is left untouched.
++            if (effectiveNative) {
++                // Managed mode sets the target to the safe native limit itself, so the old
++                // safeNative - target reserve zeroed the budget and clamped every chunk to
++                // the guard's 1 MB floor. The window lives INSIDE the target (buildLoadControl
++                // subtracts it and floors the streaming side at MIN_BUFFER_MB), so the chunk
++                // budget is that total minus the streaming floor — nativeChunkBudgetMb.
++                val chunkBudgetMb = com.nuvio.tv.ui.screens.settings.MemoryBudget.safeChunkMbForConnections(
++                    sessionConnections,
++                    com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
++                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                        NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++                    )
++                )
++                val chunkBudgetBytes = chunkBudgetMb.toLong() * 1024L * 1024L
++                if (chunkBudgetBytes < sessionChunkBytes) {
++                    Log.w(
++                        "PlayerMediaSource",
++                        "Chunk size ${sessionChunkBytes / 1024 / 1024}MB exceeds native budget for " +
++                            "$sessionConnections connections; clamped to ${chunkBudgetMb}MB"
++                    )
++                    sessionChunkBytes = chunkBudgetBytes
++                }
++            }
+             ParallelRangeDataSource.Factory(
+                 okHttpFactory,
+                 sessionConnections,
+@@ -437,9 +473,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+         private const val VOD_CACHE_TRIM_STEP_BYTES = 64L * 1024L * 1024L
+         private const val LOG_TAG = "PlayerMediaSource"
+         private const val AUTO_VOD_CACHE_FLOOR_BYTES = 2L * 1024L * 1024L * 1024L
+-        internal const val DEFAULT_USER_AGENT =
+-            "Mozilla/5.0 (Linux; Android 13; Android TV) AppleWebKit/537.36 " +
+-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++        // Honest, version-stamped player identity for the playback chain (probe, parallel
++        // chunk download, mpv, frame-rate probe, OpenSubtitles). Replaces the previous
++        // desktop-Chrome string: a browser self-description combined with an okhttp TLS
++        // fingerprint and parallel Range behavior is the classic "disguised downloader"
++        // anti-abuse signature, and it only draws scrutiny once connection counts go up.
++        // Scraping chains (YouTube extractor, subtitle timing) keep their own browser UA.
++        internal val DEFAULT_USER_AGENT =
++            "NuvioTV/" + com.nuvio.tv.BuildConfig.VERSION_NAME +
++                " (Linux; Android " + android.os.Build.VERSION.RELEASE + ") " +
++                "AndroidXMedia3/" + androidx.media3.common.MediaLibraryInfo.VERSION
+ 
+         private const val MIME_PROBE_CACHE_SIZE = 64
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+index ebc06ae3..7a832dc4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+@@ -44,8 +44,11 @@ internal object PlayerPlaybackNetworking {
+      */
+     internal val trustAllPlaybackHttpClient: OkHttpClient by lazy {
+         val dispatcher = okhttp3.Dispatcher().apply {
+-            maxRequests = 64
+-            maxRequestsPerHost = 32
++            // OkHttpDataSource issues synchronous calls, which the dispatcher does not
++            // throttle; the limits only matter if a future media3/okhttp version switches
++            // to enqueue(). Sized for the 64-connection window plus bypass/probe margin.
++            maxRequests = 128
++            maxRequestsPerHost = 128
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+@@ -71,8 +74,9 @@ internal object PlayerPlaybackNetworking {
+      */
+     internal val playbackHttpClient: OkHttpClient by lazy {
+         val dispatcher = okhttp3.Dispatcher().apply {
+-            maxRequests = 64
+-            maxRequestsPerHost = 32
++            // See trustAllPlaybackHttpClient: sized for the 64-connection window plus margin.
++            maxRequests = 128
++            maxRequestsPerHost = 128
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+index 02fa22a8..7230fb04 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+@@ -34,6 +34,10 @@ object MemoryBudget {
+     private const val PREFETCH_DEPTH_LOWER_MULTIPLE = 2
+     private const val PREFETCH_DEPTH_UPPER_MULTIPLE = 4
+ 
++    // In-flight chunk headroom above the window depth, mirroring the session chunk cap
++    // (depth + 2 low-RAM / + 4 otherwise); used by the engine-side chunk guard.
++    private const val IN_FLIGHT_CHUNK_HEADROOM = 4
++
+     const val MIN_CONNECTIONS = 2
+     const val MAX_CONNECTIONS = 4
+     const val MIN_CHUNK_MB = 8
+@@ -169,12 +173,42 @@ object MemoryBudget {
+         val chunkBudgetMb = (safeNativeLimitMb - reserveBufferMb.coerceAtLeast(0))
+             .coerceAtLeast(chunkMb * PREFETCH_DEPTH_LOWER_MULTIPLE)
+         val byBudget = chunkBudgetMb / chunkMb
+-        return byBudget.coerceIn(
+-            connections * PREFETCH_DEPTH_LOWER_MULTIPLE,
+-            connections * PREFETCH_DEPTH_UPPER_MULTIPLE
+-        )
++        // The window never drops below connections + 1 (the reader's own chunk must always be
++        // schedulable), and it only exceeds the budget's own chunk count when the connection
++        // count itself demands it. The old coerceIn(connections * 2, connections * 4) threw
++        // IllegalArgumentException whenever the budget could not fund 2 chunks per connection,
++        // which 64 connections reaches on every tier.
++        val byConnections = connections + 1
++        return byBudget.coerceIn(byConnections, byConnections * PREFETCH_DEPTH_UPPER_MULTIPLE)
+     }
+ 
++    /**
++     * Largest chunk size whose worst-case retained set still fits the buffer budget:
++     * (connections + 1 + in-flight headroom) buffers, mirroring the session chunk cap
++     * (depth + 2 low-RAM / + 4 otherwise) plus the reader's own chunk. Keeps the engine
++     * memory-bounded when the configured chunk would overcommit, e.g. 64 connections
++     * with 8-16 MB chunks on a 2 GB device. Floor is 1 MB: below that, lowering the
++     * connection count is the right lever, not smaller chunks.
++     */
++    fun safeChunkMbForConnections(connections: Int, bufferBudgetMb: Int): Int =
++        (bufferBudgetMb / (connections + IN_FLIGHT_CHUNK_HEADROOM + 1))
++            .coerceIn(1, MAX_CHUNK_MB)
++
++    /**
++     * Chunk-window budget on the native tier — single source for the engine-side guard
++     * (PlayerMediaSourceFactory), the prefetch depth and the settings-UI chunk filter.
++     *
++     * buildLoadControl() carves the parallel window out of the allocator target and floors
++     * the streaming remainder at [MIN_BUFFER_MB], so the window may spend everything above
++     * that floor. The previous wiring subtracted the whole target from the safe native
++     * limit; with the budget managed the target EQUALS that limit, so the chunk budget
++     * collapsed to zero and pinned every connection count to the guard's 1 MB floor. An
++     * override target above the safe limit buys streaming headroom only, never window
++     * headroom, hence the min().
++     */
++    fun nativeChunkBudgetMb(targetBufferMb: Int, safeNativeLimitMb: Int): Int =
++        (minOf(targetBufferMb, safeNativeLimitMb) - MIN_BUFFER_MB).coerceAtLeast(0)
++
+     /** Max chunk size that fits budget given current buffer size */
+     fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
+         ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+index d017af43..6395de08 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+@@ -345,6 +345,8 @@ private fun ParallelNetworkControls(
+     settings: PlayerSettings,
+     updateMemory: PlaybackSettingsUpdate
+ ) {
++    val context = LocalContext.current
++
+     SettingsToggleRow(
+         title = stringResource(R.string.playback_net_parallel),
+         subtitle = stringResource(R.string.playback_net_parallel_sub),
+@@ -359,13 +361,30 @@ private fun ParallelNetworkControls(
+             value = settings.parallelConnectionCount,
+             valueText = settings.parallelConnectionCount.toString(),
+             minValue = MemoryBudget.MIN_CONNECTIONS,
+-            maxValue = if (settings.nuvioPerformanceModeEnabled) 16 else MemoryBudget.MAX_CONNECTIONS,
++            maxValue = if (settings.nuvioPerformanceModeEnabled) {
++                PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY
++            } else {
++                MemoryBudget.MAX_CONNECTIONS
++            },
+             step = 1,
+             onValueChange = { count -> updateMemory { setParallelConnectionCount(count) } }
+         )
+ 
+         val maxChunkSizeMb = if (settings.nuvioPerformanceModeEnabled) {
+-            MemoryBudget.tierMaxChunkMb
++            // Mirror the engine-side budget guard (PlayerMediaSourceFactory) so the slider
++            // never offers a chunk size the engine would silently clamp at assembly time:
++            // window depth + in-flight headroom buffers must fit the native budget.
++            val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++            minOf(
++                MemoryBudget.tierMaxChunkMb,
++                MemoryBudget.safeChunkMbForConnections(
++                    settings.parallelConnectionCount,
++                    MemoryBudget.nativeChunkBudgetMb(
++                        NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                        safeNativeMb
++                    )
++                )
++            )
+         } else {
+             MemoryBudget.maxChunkMb(
+                 MemoryBudget.effectiveBufferMb(settings.bufferSettings.targetBufferSizeMb),
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 5906b595..c67b021b 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3367,7 +3367,7 @@
+     <string name="playback_net_parallel">Parallel Connections</string>
+     <string name="playback_net_parallel_sub">Use multiple connections in parallel for fetching streams. Activate when you experience buffering although your download speed is definitely more than sufficient.</string>
+     <string name="playback_net_connection_count">Connection Count</string>
+-    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values increase memory usage and throughput but with diminishing returns.</string>
++    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values increase memory usage and throughput but with diminishing returns. Values above 16 need ExoPlayer Native Memory and may trigger rate limiting on strict servers.</string>
+     <string name="playback_net_chunk_size">Chunk Size</string>
+     <string name="playback_net_chunk_size_sub">Size of each download chunk per connection. Larger chunks reduce overhead but use more memory.</string>
+ 
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
+new file mode 100644
+index 00000000..d583163b
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
+@@ -0,0 +1,165 @@
++@file:OptIn(UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Ledger tests for the native-tier chunk budget, pinned to the REAL device RAM
++ * tiers of NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb()
++ * (100 / 200 / 200 / 500 / 1000 / 1600 / 2000 MB) and to the reserve semantics
++ * of MemoryBudget.nativeChunkBudgetMb (streaming floor MIN_BUFFER_MB, not the
++ * managed target itself).
++ *
++ * Regression background: the previous wiring charged the whole allocator target
++ * as the reserve (safeNative - targetBufferSizeMb). In managed performance mode
++ * the target EQUALS the safe native limit, so the chunk budget collapsed to
++ * zero, the guard pinned every connection count to its 1 MB floor (settings UI
++ * offered only 256 KB / 512 KB / 1 MB) and the prefetch depth check went inert
++ * at its c+1 floor.
++ */
++@OptIn(UnstableApi::class)
++class MemoryBudgetNativeChunkBudgetTest {
++
++    // Real safe-native tiers by RAM band: <=1.15GB→100, <1.45GB→200, <2.3GB→200,
++    // <3.2GB→500, <4.8GB→1000, <6.8GB→1600, else→2000.
++    private val realTiers = intArrayOf(100, 200, 500, 1000, 1600, 2000)
++
++    @Test
++    fun testNativeChunkBudgetManagedModeIsNeverZero() {
++        // Managed mode: target == safe limit. The old wiring (safeNative - target)
++        // returned 0 here for EVERY tier; the budget is now the total minus the
++        // streaming floor (MIN_BUFFER_MB = 25).
++        realTiers.forEach { tier ->
++            assertEquals(tier - 25, MemoryBudget.nativeChunkBudgetMb(tier, tier))
++        }
++    }
++
++    @Test
++    fun testNativeChunkBudgetCustomTargetBelowLimit() {
++        // Custom (non-managed) target: the window must fit inside what the user
++        // actually granted, not the device ceiling.
++        assertEquals(75, MemoryBudget.nativeChunkBudgetMb(100, 1000))
++        assertEquals(25, MemoryBudget.nativeChunkBudgetMb(50, 200))
++    }
++
++    @Test
++    fun testNativeChunkBudgetOverrideCappedBySafeLimit() {
++        // Large-target-buffer override may raise the target above the safe limit;
++        // the extra buys streaming headroom only, never window headroom.
++        assertEquals(175, MemoryBudget.nativeChunkBudgetMb(2048, 200))
++        assertEquals(975, MemoryBudget.nativeChunkBudgetMb(2048, 1000))
++    }
++
++    @Test
++    fun testNativeChunkBudgetFloorZero() {
++        assertEquals(0, MemoryBudget.nativeChunkBudgetMb(10, 200))
++        assertEquals(0, MemoryBudget.nativeChunkBudgetMb(25, 2000))
++    }
++
++    @Test
++    fun testSafeChunkScalingOnTwoGbTier() {
++        // 2 GB-class TV (RAM < 2.3 GB -> safeNative 200), managed mode.
++        val budget = MemoryBudget.nativeChunkBudgetMb(200, 200) // 175
++        assertEquals(25, MemoryBudget.safeChunkMbForConnections(2, budget))
++        assertEquals(13, MemoryBudget.safeChunkMbForConnections(8, budget))
++        assertEquals(8, MemoryBudget.safeChunkMbForConnections(16, budget))
++        assertEquals(4, MemoryBudget.safeChunkMbForConnections(32, budget))
++        assertEquals(2, MemoryBudget.safeChunkMbForConnections(64, budget))
++    }
++
++    @Test
++    fun testUiFilterCapOnTwoGbTier() {
++        // The exact user-reported scenario: 2 GB-class TV, performance mode,
++        // 64 connections. Old wiring: budget 0 -> cap 1 MB -> only 256 KB /
++        // 512 KB / 1 MB offered. Fixed wiring: cap 2 MB (256 KB ... 2 MB).
++        val uiCap64 = minOf(
++            16, // MemoryBudget.tierMaxChunkMb on the low-RAM tier
++            MemoryBudget.safeChunkMbForConnections(
++                64,
++                MemoryBudget.nativeChunkBudgetMb(200, 200)
++            )
++        )
++        assertEquals(2, uiCap64)
++        // And at 16 connections the slider reaches 8 MB again.
++        val uiCap16 = minOf(
++            16,
++            MemoryBudget.safeChunkMbForConnections(
++                16,
++                MemoryBudget.nativeChunkBudgetMb(200, 200)
++            )
++        )
++        assertEquals(8, uiCap16)
++    }
++
++    @Test
++    fun testSafeChunkAcrossAllRealTiers() {
++        // Integer-division ledger per tier (budget = tier - 25, divisor = c + 5).
++        val expected = mapOf(
++            100 to intArrayOf(10, 5, 3, 2, 1),    // budget 75:  75/7, /13, /21, /37, /69
++            200 to intArrayOf(25, 13, 8, 4, 2),   // budget 175
++            500 to intArrayOf(67, 36, 22, 12, 6), // budget 475
++            1000 to intArrayOf(128, 75, 46, 26, 14),  // budget 975 (975/7=139 capped at 128)
++            1600 to intArrayOf(128, 121, 75, 42, 22), // budget 1575 (1575/7=225 capped at 128)
++            2000 to intArrayOf(128, 128, 94, 53, 28), // budget 1975, capped at MAX_CHUNK_MB
++        )
++        val conns = intArrayOf(2, 8, 16, 32, 64)
++        expected.forEach { (tier, caps) ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            conns.forEachIndexed { i, c ->
++                assertEquals("tier=$tier conn=$c", caps[i].toLong(),
++                    MemoryBudget.safeChunkMbForConnections(c, budget).toLong())
++            }
++        }
++    }
++
++    @Test
++    fun testWorstCaseRetainedSetFitsBudget() {
++        // safeChunk = budget / (c + 1 + 4), so the worst-case retained set
++        // (window floor + in-flight headroom) always fits the budget exactly.
++        realTiers.forEach { tier ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            intArrayOf(2, 8, 16, 32, 64).forEach { c ->
++                val chunk = MemoryBudget.safeChunkMbForConnections(c, budget)
++                assertTrue("tier=$tier conn=$c", (c + 5) * chunk <= budget)
++            }
++        }
++    }
++
++    @Test
++    fun testPrefetchDepthBudgetActiveAfterFix() {
++        // 2 GB-class TV, managed mode (total 200, reserve 25 -> 175 MB budget):
++        // the depth check is no longer inert at the c+1 floor.
++        assertEquals(175, MemoryBudget.prefetchDepthChunks(64, 1, 200, 25)) // 175/1 = 175
++        assertEquals(87, MemoryBudget.prefetchDepthChunks(64, 2, 200, 25))  // 175/2 = 87
++        assertEquals(21, MemoryBudget.prefetchDepthChunks(16, 8, 200, 25))  // 175/8 = 21
++        // Crash safety on a starving budget: floors at c+1 instead of throwing
++        // (the old coerceIn(c*2, c*4) threw IllegalArgumentException here).
++        assertEquals(65, MemoryBudget.prefetchDepthChunks(64, 1, 30, 25))   // budget 5 -> floor
++    }
++
++    @Test
++    fun testDepthTimesChunkWithinBudgetWhenFunded() {
++        // Whenever the budget funds at least the c+1 floor, depth x chunk stays
++        // within the chunk budget on every real tier.
++        realTiers.forEach { tier ->
++            val budget = MemoryBudget.nativeChunkBudgetMb(tier, tier)
++            intArrayOf(2, 8, 16, 32, 64).forEach { c ->
++                val chunk = MemoryBudget.safeChunkMbForConnections(c, budget)
++                val depth = MemoryBudget.prefetchDepthChunks(c, chunk, tier, 25)
++                val byBudget = budget / chunk.coerceAtLeast(1)
++                if (byBudget >= c + 1) {
++                    assertTrue("tier=$tier conn=$c", depth * chunk <= budget)
++                }
++                assertTrue(depth >= c + 1)
++                // The real upper bound is 4 * (c + 1): the multiplier applies to the
++                // window floor byConnections = c + 1, not to c.
++                assertTrue(depth <= 4 * (c + 1))
++            }
++        }
++    }
++}
+-- 
+2.47.3
+
+
+From 5ebe92efba0cf9092d6fb76be4a28fb987702557 Mon Sep 17 00:00:00 2001
+From: sim <sim@local>
+Date: Wed, 18 Nov 2026 19:25:08 +0000
+Subject: [PATCH 2/6] Raise parallel connection cap to 256 with byte-accurate
+ window budget
+
+Config chain: MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY=256 remains the
+single source of truth (read clamp, both write clamps); the settings slider
+max becomes tier-aware via MemoryBudget.maxConnectionsForWindowBytes so the
+UI never offers more than the engine honours (2GB @ 1MB chunks -> 174,
+@ 512KB -> 256 capped, 3GB+ -> 256).
+
+Memory: prefetchDepthBytes replaces the MB-based depth on the native tier.
+The old formula rounded sub-MB chunks up to 1 MB and its coerceIn(conns+1,
+...) floor silently oversold memory once conns+1 chunks no longer fit the
+budget - 256 x 1MB needs 257MB against the 175MB budget of a 2GB device.
+The byte-accurate variant never exceeds the budget and never throws; the
+engine-side guard (PlayerMediaSourceFactory) now clamps the session
+CONNECTION COUNT first (chunk-clamping pinned the chunk to its 1MB floor
+while the window still overcommitted at high counts), keeping the chunk
+clamp only for absurd chunk sizes.
+
+Fast start (gate 1): parallelStartupPrefetchUnlocked is set at creation
+instead of being held until STATE_READY/first frame - the old lock held
+chunk sessions to the reader's own chunk plus the continuation (1-2
+connections) for the whole initial buffering phase, stretching cold start
+to tens of seconds on throttled lines. STATE_READY/onRenderedFirstFrame
+unlock calls remain, harmlessly idempotent.
+
+Capacity: executor 80/160 -> 272/328, shared pool idle 128 -> 512 (2x the
+256 cap, aria2-aligned), both dispatchers 128/128 -> 512/512.
+
+Strings: connection-count subtitle updated to the 256-era semantics
+(default locale only; translations to follow).
+---
+ .../tv/data/local/PlayerSettingsDataStore.kt  |  8 ++-
+ .../player/NuvioExoPlayerPerformanceHelper.kt |  4 +-
+ .../player/PlayerMediaSourceFactory.kt        | 58 ++++++++++++++-----
+ .../player/PlayerPlaybackNetworking.kt        | 12 ++--
+ .../tv/ui/screens/settings/MemoryBudget.kt    | 54 +++++++++++++++++
+ .../settings/PlaybackBufferNetworkSettings.kt | 18 +++++-
+ app/src/main/res/values/strings.xml           |  2 +-
+ 7 files changed, 131 insertions(+), 25 deletions(-)
+
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 7fa4405c..7eea75d3 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -494,7 +494,13 @@ data class PlayerSettings(
+         // Upper bound when ExoPlayer Native Memory (performance mode) is active.
+         // Single source of truth for the read clamp, both write clamps and the UI slider;
+         // keep in sync with MemoryBudget.MAX_CONNECTIONS for the non-native tier.
+-        const val MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 64
++        // 256: the cap is a ceiling, not a guarantee — the engine-side guard
++        // (PlayerMediaSourceFactory) clamps the effective session count to what the
++        // device's native window budget actually funds (e.g. 174 at 1 MB chunks on a
++        // 2 GB device, 256 at 512 KB or on 3 GB+ tiers), and the settings slider
++        // mirrors that same tier budget so the UI never offers more than the engine
++        // would honour.
++        const val MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 256
+         const val MIN_PARALLEL_CHUNK_SIZE_KB = 256
+         const val MAX_PARALLEL_CHUNK_SIZE_KB = 128 * 1024
+         const val DEFAULT_ENABLE_HTTP2 = false
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+index 54886d5f..4a635462 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
+@@ -62,9 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
+     const val DEFAULT_NUVIO_BACK_BUFFER_MS = 15_000
+     const val DEFAULT_NUVIO_INITIAL_BITRATE_ESTIMATE = 50_000_000L     // 50 Mbps
+     // Parallel chunk fetching keeps more sockets alive than the old cap of 8, which was evicting
+-    // live chunk connections mid playback and forcing cold reopens. Sized at 2x the 64-connection
++    // live chunk connections mid playback and forcing cold reopens. Sized at 2x the 256-connection
+     // cap (aria2-aligned) so a full window returns its sockets to the pool instead of churning.
+-    const val NUVIO_SHARED_POOL_MAX_IDLE = 128
++    const val NUVIO_SHARED_POOL_MAX_IDLE = 512
+     private const val BACK_BUFFER_TARGET_SHARE_NUM = 1L
+     private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+index 241baa78..89e3fe72 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
+@@ -145,17 +145,18 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+         chunkBytes: Long
+     ): Int {
+         if (!nuvioPerformanceModeEnabled) return connections + 1
+-        val chunkMb = (chunkBytes / (1024L * 1024L)).toInt().coerceAtLeast(1)
+         // The window shares the allocator target with the streaming buffer (in managed mode
+         // the target IS the safe native limit), so depth budgets against that total with the
+-        // streaming floor as the reserve — see MemoryBudget.nativeChunkBudgetMb. Charging the
+-        // whole target as the reserve left the depth check inert at its c+1 floor.
+-        val totalMb = minOf(
++        // streaming floor as the reserve — see MemoryBudget.nativeChunkBudgetMb. Byte-accurate
++        // so sub-MB chunks are charged at their real size and the depth never exceeds the
++        // budget once conns + 1 chunks no longer fit (the MB variant rounds 512 KB chunks up
++        // to 1 MB and its coerceIn floor silently oversold memory at high connection counts).
++        val windowBudgetBytes = com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
+             NuvioExoPlayerPerformanceHelper.targetBufferSizeMb.coerceAtLeast(0),
+             NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
+-        )
+-        return com.nuvio.tv.ui.screens.settings.MemoryBudget.prefetchDepthChunks(
+-            connections, chunkMb, totalMb, com.nuvio.tv.ui.screens.settings.MemoryBudget.MIN_BUFFER_MB
++        ).toLong() * 1024L * 1024L
++        return com.nuvio.tv.ui.screens.settings.MemoryBudget.prefetchDepthBytes(
++            connections, chunkBytes, windowBudgetBytes
+         )
+     }
+ 
+@@ -228,9 +229,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+                 "parallel=${if (useParallelConnections) parallelConnectionCount else 0} chunkKb=$parallelChunkSizeKb"
+         )
+         val useChunkSessionSource = useParallelConnections && !isHls && !isDash
+-        parallelStartupPrefetchUnlocked.set(!useChunkSessionSource)
++        // Fast start (gate 1): background prefetch is unlocked from creation. The old
++        // lock (!useChunkSessionSource) held chunk sessions to the reader's own chunk plus
++        // the continuation connection — 1-2 connections — until the player reached READY or
++        // rendered its first frame, which on a throttled line stretched initial buffering
++        // to tens of seconds. Unlocking at creation lets the fill loop open the whole window
++        // on the first read, mirroring what prestartChunk0 already proved safe. The
++        // STATE_READY / onRenderedFirstFrame unlock calls remain, harmlessly idempotent.
++        parallelStartupPrefetchUnlocked.set(true)
+         val networkProgressiveFactory: DataSource.Factory = if (useChunkSessionSource) {
+-            val sessionConnections = parallelConnectionCount
++            var sessionConnections = parallelConnectionCount
+             val effectiveNative =
+                 nuvioPerformanceModeEnabled || NuvioEngineConfig.get().isNativeAllocationEnabled()
+             val okHttpFactory = OkHttpDataSource.Factory(playbackHttpClient).apply {
+@@ -242,11 +250,14 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+             var sessionChunkBytes = parallelChunkSizeKb
+                 .coerceAtMost(com.nuvio.tv.ui.screens.settings.MemoryBudget.tierMaxChunkMb * 1024)
+                 .toLong() * 1024L
+-            // Engine-side guard, native tier only (the tier where 64 connections and 128 MB
+-            // chunks are reachable): the window floor plus in-flight headroom must fit the
+-            // native buffer budget, whatever chunk size is stored. The settings UI already
+-            // shrinks the chunk on this tier, but sync restores and direct DataStore writes
+-            // skip that path, so clamp here too, at the last gate before buffers allocate.
++            // Engine-side guard, native tier only (the tier where high connection counts and
++            // 128 MB chunks are reachable). Primary step at the 256 cap: clamp the session
++            // CONNECTION COUNT to what the native window budget funds at the stored chunk
++            // size (window floor = conns + 1 chunks). Chunk-clamping instead (the old
++            // behaviour) pins the chunk to its 1 MB floor while the window still overcommits
++            // at high counts — 256 x 1 MB needs 257 MB against a 175 MB budget on a 2 GB
++            // device. Secondary: the chunk clamp remains for absurd chunk sizes (sync
++            // restores and direct DataStore writes skip the settings-UI filter).
+             // The non-native tier keeps the heap-budget coordination in the settings UI
+             // (MemoryBudget.maxChunkMb) and its 4-connection cap, so it is left untouched.
+             if (effectiveNative) {
+@@ -255,6 +266,25 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+                 // the guard's 1 MB floor. The window lives INSIDE the target (buildLoadControl
+                 // subtracts it and floors the streaming side at MIN_BUFFER_MB), so the chunk
+                 // budget is that total minus the streaming floor — nativeChunkBudgetMb.
++                val nativeBudgetBytes = com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
++                    NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                    NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++                ).toLong() * 1024L * 1024L
++                val maxFundedConnections =
++                    com.nuvio.tv.ui.screens.settings.MemoryBudget.maxConnectionsForWindowBytes(
++                        nativeBudgetBytes,
++                        sessionChunkBytes
++                    ).coerceAtMost(
++                        com.nuvio.tv.data.local.PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY
++                    )
++                if (sessionConnections > maxFundedConnections) {
++                    Log.w(
++                        "PlayerMediaSource",
++                        "Connection count $sessionConnections exceeds native budget for " +
++                            "${sessionChunkBytes / 1024}KB chunks; clamped to $maxFundedConnections"
++                    )
++                    sessionConnections = maxFundedConnections
++                }
+                 val chunkBudgetMb = com.nuvio.tv.ui.screens.settings.MemoryBudget.safeChunkMbForConnections(
+                     sessionConnections,
+                     com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+index 7a832dc4..35445806 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+@@ -46,9 +46,9 @@ internal object PlayerPlaybackNetworking {
+         val dispatcher = okhttp3.Dispatcher().apply {
+             // OkHttpDataSource issues synchronous calls, which the dispatcher does not
+             // throttle; the limits only matter if a future media3/okhttp version switches
+-            // to enqueue(). Sized for the 64-connection window plus bypass/probe margin.
+-            maxRequests = 128
+-            maxRequestsPerHost = 128
++            // to enqueue(). Sized for the 256-connection window plus bypass/probe margin.
++            maxRequests = 512
++            maxRequestsPerHost = 512
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+@@ -74,9 +74,9 @@ internal object PlayerPlaybackNetworking {
+      */
+     internal val playbackHttpClient: OkHttpClient by lazy {
+         val dispatcher = okhttp3.Dispatcher().apply {
+-            // See trustAllPlaybackHttpClient: sized for the 64-connection window plus margin.
+-            maxRequests = 128
+-            maxRequestsPerHost = 128
++            // See trustAllPlaybackHttpClient: sized for the 256-connection window plus margin.
++            maxRequests = 512
++            maxRequestsPerHost = 512
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+index 7230fb04..7d97b2e2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+@@ -38,6 +38,10 @@ object MemoryBudget {
+     // (depth + 2 low-RAM / + 4 otherwise); used by the engine-side chunk guard.
+     private const val IN_FLIGHT_CHUNK_HEADROOM = 4
+ 
++    // Adaptive hedge: absolute floor for the stall threshold (16 KB/s). A connection
++    // moving slower than this is genuinely stalled even on a heavily throttled line.
++    const val HEDGE_STALL_FLOOR_BPS = 16L * 1024L
++
+     const val MIN_CONNECTIONS = 2
+     const val MAX_CONNECTIONS = 4
+     const val MIN_CHUNK_MB = 8
+@@ -209,6 +213,56 @@ object MemoryBudget {
+     fun nativeChunkBudgetMb(targetBufferMb: Int, safeNativeLimitMb: Int): Int =
+         (minOf(targetBufferMb, safeNativeLimitMb) - MIN_BUFFER_MB).coerceAtLeast(0)
+ 
++    /**
++     * Byte-accurate window depth for the native tier. The MB-based [prefetchDepthChunks]
++     * rounds sub-MB chunks up (a 512 KB chunk is charged as 1 MB) and its
++     * coerceIn(connections + 1, ...) floor silently oversells memory once conns + 1
++     * chunks no longer fit the budget — e.g. 256 x 1 MB needs 257 MB against a 175 MB
++     * budget on a 2 GB device. This variant never exceeds the budget and never throws:
++     * when the budget cannot fund connections + 1 chunks the window is simply
++     * memory-bounded, and the connection count itself is clamped upstream via
++     * [maxConnectionsForWindowBytes] so the conns + 1 floor stays meaningful.
++     */
++    fun prefetchDepthBytes(connections: Int, chunkBytes: Long, windowBudgetBytes: Long): Int {
++        val chunk = chunkBytes.coerceAtLeast(1L)
++        val byBudget = (windowBudgetBytes / chunk).toInt()
++        val floor = connections + 1
++        if (byBudget >= floor) {
++            return byBudget.coerceAtMost(floor * PREFETCH_DEPTH_UPPER_MULTIPLE)
++        }
++        return byBudget.coerceAtLeast(1)
++    }
++
++    /**
++     * Largest connection count whose window floor (connections + 1 chunks) still fits
++     * the native window budget — the primary engine-side guard at high connection
++     * counts. Lowering the connection count is the right lever when the pair does not
++     * fit: clamping the chunk instead (the old [safeChunkMbForConnections] behaviour)
++     * pins the chunk to its 1 MB floor while the window still overcommits. Callers
++     * combine this with the configured hard cap (e.g. 256 on the native tier).
++     */
++    fun maxConnectionsForWindowBytes(windowBudgetBytes: Long, chunkBytes: Long): Int =
++        ((windowBudgetBytes / chunkBytes.coerceAtLeast(1L)) - 1L)
++            .toInt()
++            .coerceAtLeast(MIN_CONNECTIONS)
++
++    /**
++     * Adaptive hedge stall threshold for the parallel chunk engine. A fixed 256 KB/s
++     * (= 2 Mbps) stall threshold kills perfectly healthy connections whenever the
++     * carrier throttles per-connection throughput below that mark, and each kill costs
++     * a fresh TCP slow start plus a TIME_WAIT socket. The threshold instead tracks the
++     * session's own median chunk rate at a quarter, floored at 16 KB/s: only genuinely
++     * stalled transfers (no progress at all, or four times slower than the session
++     * median) are restarted. Empty samples fall back to the legacy CDN constant so the
++     * first chunks of a session behave exactly as before.
++     */
++    fun hedgeStallThresholdBps(sampleRatesBps: List<Long>, legacyDefaultBps: Long): Long {
++        if (sampleRatesBps.isEmpty()) return legacyDefaultBps
++        val sorted = sampleRatesBps.sorted()
++        val median = sorted[sorted.size / 2]
++        return maxOf(HEDGE_STALL_FLOOR_BPS, median / 4L)
++    }
++
+     /** Max chunk size that fits budget given current buffer size */
+     fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
+         ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+index 6395de08..46b717a8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
+@@ -362,7 +362,23 @@ private fun ParallelNetworkControls(
+             valueText = settings.parallelConnectionCount.toString(),
+             minValue = MemoryBudget.MIN_CONNECTIONS,
+             maxValue = if (settings.nuvioPerformanceModeEnabled) {
+-                PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY
++                // Tier-aware: never offer more connections than the native window budget
++                // funds at the current chunk size (window floor = conns + 1 chunks) —
++                // the engine-side guard clamps anything above it at assembly time, so the
++                // slider should not offer it. 2 GB device @ 1 MB chunks -> 174,
++                // @ 512 KB -> 256 (hard-capped); 3 GB+ tiers -> 256.
++                val safeNativeMb = NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context)
++                val windowBudgetBytes = MemoryBudget.nativeChunkBudgetMb(
++                    NuvioExoPlayerPerformanceHelper.targetBufferSizeMb,
++                    safeNativeMb
++                ).toLong() * 1024L * 1024L
++                minOf(
++                    PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY,
++                    MemoryBudget.maxConnectionsForWindowBytes(
++                        windowBudgetBytes,
++                        settings.parallelChunkSizeKb.toLong() * 1024L
++                    )
++                )
+             } else {
+                 MemoryBudget.MAX_CONNECTIONS
+             },
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c67b021b..d466e2a4 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3367,7 +3367,7 @@
+     <string name="playback_net_parallel">Parallel Connections</string>
+     <string name="playback_net_parallel_sub">Use multiple connections in parallel for fetching streams. Activate when you experience buffering although your download speed is definitely more than sufficient.</string>
+     <string name="playback_net_connection_count">Connection Count</string>
+-    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values increase memory usage and throughput but with diminishing returns. Values above 16 need ExoPlayer Native Memory and may trigger rate limiting on strict servers.</string>
++    <string name="playback_net_connection_count_sub">Number of parallel TCP connections. Higher values raise throughput under per-connection throttling but use more memory. The slider maximum follows your device\'s memory tier and the chosen chunk size; values above 4 require ExoPlayer Native Memory and may trigger rate limiting on strict servers.</string>
+     <string name="playback_net_chunk_size">Chunk Size</string>
+     <string name="playback_net_chunk_size_sub">Size of each download chunk per connection. Larger chunks reduce overhead but use more memory.</string>
+ 
+-- 
+2.47.3
+
+
+From 821b62918d1f9b2bbd35d9d4d82aa66ac6238651 Mon Sep 17 00:00:00 2001
+From: sim <sim@local>
+Date: Wed, 18 Nov 2026 19:25:14 +0000
+Subject: [PATCH 3/6] Parallel engine: hard concurrency gate, fast start,
+ adaptive hedge threshold
+
+Connection gate (P1): every window chunk download now acquires a fair
+per-instance semaphore sized by parallelConnections, making the setting
+the real cap. Without it the fill loop submits depth futures at once and
+the executor core - not the setting - decided how many sockets open (the
+'set 64, see 80+' overage). Reader continuation stays outside the gate;
+cancelled/abandoned futures bail before contending for a permit.
+
+Fast start (gate 2): sessions with >= 32 connections bypass the 1MB
+EARNED_PREFETCH re-earn after every open/seek. At throttled per-connection
+speeds that gate cost 4-16 seconds of single-connection ramp in exactly
+the phase where full concurrency matters most; 1MB chunks meant it was
+re-earned one full chunk at a time.
+
+Adaptive hedge (P7): the fixed 256 KB/s (2 Mbps) stall threshold killed
+healthy connections whenever the carrier throttled per-connection
+throughput below it - each kill costing a fresh TCP slow start and a
+TIME_WAIT socket. The threshold now tracks a quarter of the session's
+median chunk completion rate (32-sample window, floored at 16 KB/s via
+MemoryBudget.hedgeStallThresholdBps), so only genuine stalls (no progress,
+or 4x slower than the session median) are restarted. Empty samples fall
+back to the legacy CDN/usenet constants, keeping first-chunk behaviour
+identical. HEDGE_SAMPLE logs the active threshold (stallBps).
+
+Executor core 80/160 -> 272/328 (deepest legal window 257 + in-flight
+headroom + escalations; threads spawn lazily, smaller configs unaffected).
+---
+ .../screens/player/ParallelRangeDataSource.kt | 100 ++++++++++++++++--
+ 1 file changed, 92 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index 09d13935..1587b4a2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -75,10 +75,13 @@ internal class ParallelRangeDataSource(
+             override fun initialValue(): ByteArray = ByteArray(READ_BUFFER_SIZE)
+         }
+ 
+-        // Core size covers the deepest legal window (64 connections -> 65 chunks) plus the
+-        // session's in-flight headroom (+4) and reader escalations/probes. The unbounded
+-        // queue means core is the real concurrency ceiling, so it must scale with the
+-        // connection cap; idle threads die after 60s (allowCoreThreadTimeOut).
++        // Core size covers the deepest legal window (256 connections -> 257 chunks) plus
++        // the session's in-flight headroom (+4) and reader escalations/probes. The
++        // unbounded queue means core is the real concurrency ceiling, so it must scale
++        // with the connection cap; idle threads die after 60s (allowCoreThreadTimeOut).
++        // Real per-session concurrency is additionally capped by the per-instance
++        // connectionGate (parallelConnections), so the core only needs to cover the
++        // deepest legal window, and threads spawn lazily on smaller configurations.
+         private val sharedExecutor: ExecutorService by lazy {
+             val threadFactory = ThreadFactory { runnable ->
+                 Thread(runnable, "parallel-ds-worker").apply {
+@@ -87,7 +90,7 @@ internal class ParallelRangeDataSource(
+                 }
+             }
+             ThreadPoolExecutor(
+-                80, 160, 60L, TimeUnit.SECONDS,
++                272, 328, 60L, TimeUnit.SECONDS,
+                 java.util.concurrent.LinkedBlockingQueue<Runnable>(),
+                 threadFactory,
+                 ThreadPoolExecutor.DiscardPolicy()
+@@ -119,6 +122,13 @@ internal class ParallelRangeDataSource(
+ 
+         private const val EARNED_PREFETCH_BYTES = 1L * 1024L * 1024L
+ 
++        // Fast start: sessions with at least this many connections bypass the 1 MB
++        // re-earn gate above (see scheduleChunks).
++        private const val FAST_START_MIN_CONNECTIONS = 32
++
++        // Adaptive hedge: per-chunk completion-rate sample window (see ChunkSession).
++        private const val HEDGE_RATE_SAMPLE_LIMIT = 32
++
+         private const val EVICTION_TOUCH_GUARD_MS = 2_000L
+ 
+         private const val MAX_CONSECUTIVE_ZERO_READS = 3
+@@ -205,6 +215,22 @@ internal class ParallelRangeDataSource(
+                 lastReadChunkIndex = chunkIndex
+             }
+ 
++            // Adaptive hedge: per-chunk completion rates (bytes/s), most recent
++            // HEDGE_RATE_SAMPLE_LIMIT samples. The stall threshold tracks a quarter of
++            // the median so healthy-but-throttled connections (0.5-2 Mbps on carrier
++            // evening throttles) are not restarted — each restart costs a fresh TCP slow
++            // start and a TIME_WAIT socket. Empty samples fall back to the legacy fixed
++            // threshold, so the first chunks of a session behave exactly as before.
++            val completedChunkRatesBps = java.util.concurrent.ConcurrentLinkedQueue<Long>()
++
++            fun onChunkCompleted(rateBps: Long) {
++                if (rateBps <= 0L) return
++                completedChunkRatesBps.offer(rateBps)
++                while (completedChunkRatesBps.size > HEDGE_RATE_SAMPLE_LIMIT) {
++                    completedChunkRatesBps.poll()
++                }
++            }
++
+             fun noteRateLimitHit() {
+                 val now = SystemClock.uptimeMillis()
+                 lastRateLimitAtMs = now
+@@ -561,6 +587,14 @@ internal class ParallelRangeDataSource(
+ 
+     private val maxPoolSize = effectivePrefetchDepth + 2
+ 
++    // Hard concurrency ceiling for window chunk downloads: the connection count setting
++    // becomes the real cap. Without the gate the fill loop submits depth futures at once
++    // and the executor core — not the setting — decides how many sockets actually open
++    // (the "64 connections shows 80+" overage). Fair so a seek's fresh chunks are not
++    // starved behind the backlog; the reader's continuation connection stays outside.
++    private val connectionGate =
++        java.util.concurrent.Semaphore(parallelConnections.coerceAtLeast(1), true)
++
+     private var currentChunk: DownloadedChunk? = null
+     private var currentChunkIndex: Long = -1
+     private var currentChunkReadOffset: Int = 0
+@@ -1135,7 +1169,15 @@ internal class ParallelRangeDataSource(
+                 position / chunkSize
+             }
+ 
+-        val earnedAhead = if (bytesServedThisOpen >= EARNED_PREFETCH_BYTES) effectivePrefetchDepth else 1
++        // Fast start (gate 2): the 1 MB re-earn keeps speculative window fills off streams
++        // the player abandons immediately, but at high connection counts it costs 4-16
++        // seconds of single-connection ramp after EVERY open/seek (1 MB through one
++        // throttled pipe) — exactly the phase where full concurrency matters most. High-
++        // parallel sessions skip it and fill at depth from the first read.
++        val earnedAhead = if (
++            bytesServedThisOpen >= EARNED_PREFETCH_BYTES ||
++            parallelConnections >= FAST_START_MIN_CONNECTIONS
++        ) effectivePrefetchDepth else 1
+ 
+         val maxAhead = session?.currentAllowedDepth(effectivePrefetchDepth)?.coerceAtMost(earnedAhead)
+             ?: earnedAhead
+@@ -1156,6 +1198,20 @@ internal class ParallelRangeDataSource(
+             activeSession.touch(chunkIndex)
+             Log.d(TAG, "Scheduling chunk $chunkIndex")
+             sharedExecutor.execute {
++                // Fast bail before contending for a gate permit.
++                if (future.isCancelled || activeSession.abandoned.get()) {
++                    if (!future.isCancelled) {
++                        future.completeExceptionally(IOException("Session abandoned"))
++                    }
++                    return@execute
++                }
++                try {
++                    connectionGate.acquire()
++                } catch (e: InterruptedException) {
++                    future.completeExceptionally(e)
++                    Thread.currentThread().interrupt()
++                    return@execute
++                }
+                 try {
+                     if (!future.isCancelled && !activeSession.abandoned.get()) {
+                         val result = downloadChunk(activeSession, chunkIndex, future)
+@@ -1175,6 +1231,8 @@ internal class ParallelRangeDataSource(
+                     future.completeExceptionally(
+                         IOException("Native chunk buffer allocation failed (out of memory)", e)
+                     )
++                } finally {
++                    connectionGate.release()
+                 }
+             }
+             future
+@@ -1219,6 +1277,7 @@ internal class ParallelRangeDataSource(
+     }
+ 
+     private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
++        val chunkStartMs = SystemClock.elapsedRealtime()
+         val sessionLength = activeSession.totalLength
+         val start = chunkIndex * chunkSize
+         val end = if (sessionLength > 0L) {
+@@ -1244,6 +1303,13 @@ internal class ParallelRangeDataSource(
+ 
+             val expectedBytes = if (sessionLength > 0L) end - start else -1L
+             val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, allowStallRestart)
++            // Adaptive hedge bookkeeping: record this chunk's completion rate so the
++            // stall threshold tracks what the line — including any carrier throttle —
++            // actually delivers, instead of a fixed constant.
++            val chunkElapsedMs = SystemClock.elapsedRealtime() - chunkStartMs
++            if (chunkElapsedMs > 0L) {
++                activeSession.onChunkCompleted(chunk.size.toLong() * 1000L / chunkElapsedMs)
++            }
+             Log.d(TAG, "Successfully downloaded chunk $chunkIndex, size=${chunk.size} bytes")
+             return chunk
+         } finally {
+@@ -1403,7 +1469,24 @@ internal class ParallelRangeDataSource(
+         var hedgeLastCheckBytes = 0
+ 
+         val hedgeIsUsenet = activeSession.resolvedUri?.path?.contains("/usenet/") == true
+-        val hedgeStallRateBps = if (hedgeIsUsenet) HEDGE_STALL_RATE_USENET else HEDGE_STALL_RATE_CDN
++        // Adaptive stall threshold: the fixed 256 KB/s (2 Mbps) CDN constant killed
++        // healthy connections whenever the carrier throttled per-connection throughput
++        // below it — each kill costing a fresh TCP slow start and a TIME_WAIT socket.
++        // The threshold now tracks a quarter of the session's median chunk rate,
++        // floored at 16 KB/s, so only genuine stalls (no progress at all, or four
++        // times slower than the session median) are restarted. Until samples exist
++        // the legacy constants keep first-chunk behaviour unchanged.
++        val hedgeStallRateBps = if (hedgeIsUsenet) {
++            com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
++                activeSession.completedChunkRatesBps.toList(),
++                HEDGE_STALL_RATE_USENET
++            )
++        } else {
++            com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
++                activeSession.completedChunkRatesBps.toList(),
++                HEDGE_STALL_RATE_CDN
++            )
++        }
+         val hedgeWindowsRequired = if (hedgeIsUsenet) HEDGE_WINDOWS_USENET else HEDGE_WINDOWS_CDN
+         var hedgeConsecutiveStalled = 0
+         try {
+@@ -1459,7 +1542,8 @@ internal class ParallelRangeDataSource(
+                     if (hedgeStalled) hedgeConsecutiveStalled++ else hedgeConsecutiveStalled = 0
+                     Log.w(TAG, "HEDGE_SAMPLE chunk=$chunkIndex watermark=$totalRead " +
+                         "windowBytes=$hedgeWindowBytes windowMs=$hedgeWindowMs " +
+-                        "rateBps=$hedgeRateBps stalled=$hedgeStalled " +
++                        "rateBps=$hedgeRateBps stallBps=$hedgeStallRateBps " +
++                        "stalled=$hedgeStalled " +
+                         "consec=$hedgeConsecutiveStalled/$hedgeWindowsRequired " +
+                         "usenet=$hedgeIsUsenet clamp=$hudClampLatched " +
+                         "restartable=$allowStallRestart")
+-- 
+2.47.3
+
+
+From 611305ceb5f711dc6595df3522d3baea9e2e5dc4 Mon Sep 17 00:00:00 2001
+From: sim <sim@local>
+Date: Wed, 18 Nov 2026 19:25:18 +0000
+Subject: [PATCH 4/6] Ledger tests for the 256 tier + dev-256 CI workflow
+
+MemoryBudgetParallel256Test: 14 ledger tests over the real production
+source - byte-accurate depth (256x1MB on the 2GB tier -> 175 chunks, never
+the 257-chunk oversell; 512KB chunks funded at their real size -> 350),
+connection clamps by tier (174/349/474 + composed guard presets), and the
+adaptive hedge threshold (legacy fallback without samples, quarter-median
+protection for throttled-healthy connections, 16 KB/s absolute floor,
+no regression on fast lines).
+
+dev-256-build.yml: push/workflow_dispatch CI for the 256 development
+branch - runs the full :app:testFullDebugUnitTest suite, then builds the
+fullDebug APK (CI-keystore signed) and uploads it as a 14-day artifact.
+The release workflow stays untouched.
+---
+ .github/workflows/dev-256-build.yml           |  88 ++++++++++
+ .../settings/MemoryBudgetParallel256Test.kt   | 159 ++++++++++++++++++
+ 2 files changed, 247 insertions(+)
+ create mode 100644 .github/workflows/dev-256-build.yml
+ create mode 100644 app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+
+diff --git a/.github/workflows/dev-256-build.yml b/.github/workflows/dev-256-build.yml
+new file mode 100644
+index 00000000..1e3ca038
+--- /dev/null
++++ b/.github/workflows/dev-256-build.yml
+@@ -0,0 +1,88 @@
++name: Dev 256 Build
++
++# 256-connection parallel engine development branch.
++# Builds a signed-with-CI-keystore fullDebug APK on every push to dev-256
++# (and on demand), running the full app unit-test suite first so the
++# parallel-engine ledger tests (MemoryBudgetParallel256Test and friends) gate
++# the artifact. The release workflow (android-release.yml) stays untouched:
++# it is manually dispatched per release with the production signing secrets.
++
++on:
++  push:
++    branches: [dev-256]
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: dev-256-build-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  dev-256-build:
++    name: Test + build fullDebug APK (256-tier)
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Set up Java
++        uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: "17"
++          cache: gradle
++
++      - name: Prepare local properties
++        env:
++          LOCAL_PROPERTIES_BASE64: ${{ secrets.LOCAL_PROPERTIES_BASE64 }}
++          LOCAL_DEV_PROPERTIES_BASE64: ${{ secrets.LOCAL_DEV_PROPERTIES_BASE64 }}
++        run: |
++          if [ -n "$LOCAL_PROPERTIES_BASE64" ]; then
++            printf '%s' "$LOCAL_PROPERTIES_BASE64" | base64 --decode > local.properties
++          else
++            touch local.properties
++          fi
++
++          if [ -n "$LOCAL_DEV_PROPERTIES_BASE64" ]; then
++            printf '%s' "$LOCAL_DEV_PROPERTIES_BASE64" | base64 --decode > local.dev.properties
++          else
++            touch local.dev.properties
++          fi
++
++      - name: Prepare CI signing config
++        run: |
++          keytool -genkeypair \
++            -v \
++            -keystore "$RUNNER_TEMP/ci-debug.jks" \
++            -storepass android \
++            -alias androiddebugkey \
++            -keypass android \
++            -dname "CN=Android Debug,O=Android,C=US" \
++            -keyalg RSA \
++            -keysize 2048 \
++            -validity 10000
++
++          {
++            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
++            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
++            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
++            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
++          } >> "$GITHUB_ENV"
++
++      - name: Run full unit test suite (incl. parallel-256 ledger tests)
++        run: ./gradlew :app:testFullDebugUnitTest --stacktrace
++
++      - name: Build fullDebug APK
++        run: ./gradlew :app:assembleFullDebug --stacktrace
++
++      - name: Upload fullDebug APK
++        uses: actions/upload-artifact@v7
++        with:
++          name: NuvioTV-dev256-fullDebug-${{ github.sha }}
++          path: app/build/outputs/apk/full/debug/app-full-universal-debug.apk
++          archive: false
++          if-no-files-found: error
++          retention-days: 14
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+new file mode 100644
+index 00000000..c42e5566
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+@@ -0,0 +1,159 @@
++@file:OptIn(UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Ledger tests for the 256-connection tier: byte-accurate prefetch depth
++ * (MemoryBudget.prefetchDepthBytes), the connection-count clamp
++ * (MemoryBudget.maxConnectionsForWindowBytes) and the adaptive hedge stall
++ * threshold (MemoryBudget.hedgeStallThresholdBps).
++ *
++ * Regression background: the MB-based depth rounded sub-MB chunks up (a 512 KB
++ * chunk was charged as 1 MB) and its coerceIn(conns + 1, ...) floor silently
++ * oversold memory once conns + 1 chunks no longer fit the window budget —
++ * 256 x 1 MB needs 257 MB against the 175 MB budget of a 2 GB device
++ * (nativeChunkBudgetMb = safeNative 200 - MIN_BUFFER_MB 25). The old
++ * safeChunkMbForConnections-only guard made that WORSE at high counts: it
++ * clamped the chunk to its 1 MB floor while the window still overcommitted.
++ *
++ * The fixed 256 KB/s (2 Mbps) hedge stall threshold killed healthy connections
++ * under carrier evening throttling (0.5-2 Mbps per connection); the adaptive
++ * threshold tracks a quarter of the session's median chunk rate, floored at
++ * 16 KB/s, so only genuine stalls are restarted.
++ */
++@OptIn(UnstableApi::class)
++class MemoryBudgetParallel256Test {
++
++    private val mb = 1024L * 1024L
++    private val kb = 1024L
++
++    // Real native window budgets by RAM band: safe limit - MIN_BUFFER_MB (25).
++    private val tier2GbBudgetBytes = 175L * mb   // 1.15-2.3 GB band (safe 200)
++    private val tier3GbBudgetBytes = 475L * mb   // 2.3-3.2 GB band (safe 500)
++    private val tier4GbBudgetBytes = 975L * mb   // 3.2-4.8 GB band (safe 1000)
++
++    // ── prefetchDepthBytes ────────────────────────────────────────────────────
++
++    @Test
++    fun testDepthNeverExceedsByteBudget() {
++        // The old MB formula returned 257 chunks for 256 x 1 MB on every tier
++        // (coerceIn floor), overselling 82 MB on the 2 GB budget.
++        val depth = MemoryBudget.prefetchDepthBytes(256, mb, tier2GbBudgetBytes)
++        assertEquals(175, depth)
++        assertTrue(depth * mb <= tier2GbBudgetBytes)
++    }
++
++    @Test
++    fun testDepthByteAccurateForSubMbChunks() {
++        // 256 x 512 KB on the 2 GB tier: the MB formula charged each 512 KB chunk
++        // as 1 MB (byBudget = 175); the byte-accurate form funds 350 real chunks.
++        val depth = MemoryBudget.prefetchDepthBytes(256, 512L * kb, tier2GbBudgetBytes)
++        assertEquals(350, depth)
++        assertEquals(tier2GbBudgetBytes, depth * 512L * kb)
++    }
++
++    @Test
++    fun testDepthUpperMultipleCapPreserved() {
++        // Upper bound stays 4x the window floor: 2 connections -> at most 12 chunks.
++        assertEquals(12, MemoryBudget.prefetchDepthBytes(2, mb, tier4GbBudgetBytes))
++        assertEquals(24, MemoryBudget.prefetchDepthBytes(5, mb, tier4GbBudgetBytes))
++    }
++
++    @Test
++    fun testDepthMemoryBoundedWhenFloorCannotBeFunded() {
++        // Budget cannot fund conns + 1 chunks: the window is memory-bounded and
++        // never throws (the MB variant's coerceIn would have raised the depth to
++        // the floor and oversold). Callers clamp the connection count instead.
++        assertEquals(10, MemoryBudget.prefetchDepthBytes(256, 16L * mb, tier2GbBudgetBytes))
++        assertEquals(1, MemoryBudget.prefetchDepthBytes(256, 256L * mb, tier2GbBudgetBytes))
++    }
++
++    @Test
++    fun testDepthOn3GbTierFundsFullWindow() {
++        // 256 x 1 MB on the 3 GB tier: budget 475 MB, floor 257 -> byBudget 475.
++        assertEquals(475, MemoryBudget.prefetchDepthBytes(256, mb, tier3GbBudgetBytes))
++    }
++
++    @Test
++    fun testDepthMatchesLegacyBehaviourWhenBudgetIsNotBinding() {
++        // 64 x 1 MB on every tier must keep the 64-era values (budget >= 65 chunks
++        // funds the same window the MB formula produced).
++        assertEquals(175, MemoryBudget.prefetchDepthBytes(64, mb, tier2GbBudgetBytes))
++        assertEquals(260, MemoryBudget.prefetchDepthBytes(64, mb, tier3GbBudgetBytes))
++    }
++
++    // ── maxConnectionsForWindowBytes ──────────────────────────────────────────
++
++    @Test
++    fun testMaxConnectionsByTier() {
++        assertEquals(174, MemoryBudget.maxConnectionsForWindowBytes(tier2GbBudgetBytes, mb))
++        assertEquals(349, MemoryBudget.maxConnectionsForWindowBytes(tier2GbBudgetBytes, 512L * kb))
++        assertEquals(474, MemoryBudget.maxConnectionsForWindowBytes(tier3GbBudgetBytes, mb))
++    }
++
++    @Test
++    fun testMaxConnectionsFloorsAtMinimum() {
++        // Budget smaller than a single chunk: degenerate config, floor at
++        // MIN_CONNECTIONS instead of zero/negative.
++        assertEquals(2, MemoryBudget.maxConnectionsForWindowBytes(mb, 2L * mb))
++        assertEquals(2, MemoryBudget.maxConnectionsForWindowBytes(0, mb))
++    }
++
++    @Test
++    fun testComposedGuardMatchesShippedPresets() {
++        // The engine-side guard composes the funded count with the configured hard
++        // cap (PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY = 256).
++        // 2 GB @ 1 MB -> 174; 2 GB @ 512 KB -> 256 (capped, 349 funded); 3 GB+ -> 256.
++        val cap = 256
++        assertEquals(174, minOf(cap, MemoryBudget.maxConnectionsForWindowBytes(tier2GbBudgetBytes, mb)))
++        assertEquals(256, minOf(cap, MemoryBudget.maxConnectionsForWindowBytes(tier2GbBudgetBytes, 512L * kb)))
++        assertEquals(256, minOf(cap, MemoryBudget.maxConnectionsForWindowBytes(tier3GbBudgetBytes, mb)))
++    }
++
++    // ── hedgeStallThresholdBps ────────────────────────────────────────────────
++
++    @Test
++    fun testHedgeThresholdFallsBackToLegacyWithoutSamples() {
++        // First chunks of a session (no completed-chunk samples yet) behave
++        // exactly as before: CDN 256 KB/s, usenet 128 KB/s.
++        assertEquals(256L * kb, MemoryBudget.hedgeStallThresholdBps(emptyList(), 256L * kb))
++        assertEquals(128L * kb, MemoryBudget.hedgeStallThresholdBps(emptyList(), 128L * kb))
++    }
++
++    @Test
++    fun testHedgeThresholdProtectsThrottledHealthyConnections() {
++        // Session median ~128 KB/s (1 Mbps carrier throttle): threshold drops to
++        // 32 KB/s, so a steady 128 KB/s connection is no longer restarted. The
++        // fixed 256 KB/s constant killed exactly this connection.
++        val samples = List(16) { 128L * kb + (it - 8) * 512L }
++        assertEquals(32L * kb, MemoryBudget.hedgeStallThresholdBps(samples, 256L * kb))
++        assertTrue(128L * kb >= MemoryBudget.hedgeStallThresholdBps(samples, 256L * kb))
++    }
++
++    @Test
++    fun testHedgeThresholdFlooredAtAbsoluteMinimum() {
++        // Even a crawling session (median 8 KB/s) never lets the threshold below
++        // 16 KB/s: zero-progress windows must always trip the stall detector.
++        val samples = List(8) { 8L * kb }
++        assertEquals(16L * kb, MemoryBudget.hedgeStallThresholdBps(samples, 256L * kb))
++    }
++
++    @Test
++    fun testHedgeThresholdKeepsLegacyValueOnFastLines() {
++        // Fast session (median 1 MB/s): quarter = 256 KB/s — identical to the old
++        // constant, so unthrottled behaviour does not regress.
++        val samples = List(8) { mb }
++        assertEquals(256L * kb, MemoryBudget.hedgeStallThresholdBps(samples, 256L * kb))
++    }
++
++    @Test
++    fun testHedgeFloorConstant() {
++        assertEquals(16L * kb, MemoryBudget.HEDGE_STALL_FLOOR_BPS)
++    }
++}
+-- 
+2.47.3
+
+
+From 33fd6ce1d835f0e5fd75cc5a468ea6044ca6684a Mon Sep 17 00:00:00 2001
+From: sim <sim@local>
+Date: Thu, 19 Nov 2026 04:58:28 +0000
+Subject: [PATCH 5/6] Parallel engine: gate-based AIMD, bounded cancel drain,
+ worker stack trim
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+P2 (429 stability): the connection gate (P1) now carries an AIMD ceiling —
+the actual number of concurrent connections — replacing the depth-halving
+collapse that pinned throughput to 1-2 connections for minutes. On a 429
+episode the ceiling halves (floor: 1/16 of the configured count, min 8, via
+MemoryBudget.aimdDecreaseGate); while quiet it recovers additively
+(+1/16 per step, <= 16 steps to full). The depth cap keeps its role for
+queued work but floors at 1/8 of the window (min 16) and recovers +1/8 per
+step instead of +1. The gate moved from per-instance to per-session so
+warm-session adoption keeps one stable server-facing budget; config raises
+between plays grow it via expandMax. HUD: hudGateCeiling + gate log lines.
+
+P4 (socket warmth): cancelling a chunk mid-body kills its socket because
+okhttp only pools fully-read bodies — after a seek, every in-flight chunk
+cancelled at once and the refill went through cold re-handshakes. The
+cancel/abandon paths now drain a NEARLY-complete body (<= 64 KB, bounded by
+MemoryBudget.CANCEL_DRAIN_MAX_BYTES) before teardown, best-effort; larger
+remainders are closed since draining would waste exactly the throttled
+per-connection bandwidth. Clears any pending cancel interrupt first.
+
+Memory: worker threads get 512 KB stacks (from the 1 MB default) — the 272
+lazily-spawned workers never nest deep, and the trim halves both stack
+address space and resident overhead. READ_BUFFER_SIZE (64 KB ThreadLocal)
+audited and left as is: ~17 MB at full depth is within budget.
+
+P9 (burst-idle, in-memory resolution): with the gate enforcing the real
+connection count and P7 no longer killing throttled-healthy connections,
+in-flight settles at playback_rate / per_connection_rate (Little's law) —
+the equilibrium is stable without a pacing scheduler, and P4 keeps sockets
+warm across refill boundaries. The disk-cache variant is explicitly out of
+scope per the no-disk-writeback constraint.
+---
+ .../screens/player/ParallelRangeDataSource.kt | 189 ++++++++++++++++--
+ .../tv/ui/screens/settings/MemoryBudget.kt    |  49 +++++
+ 2 files changed, 218 insertions(+), 20 deletions(-)
+
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index 1587b4a2..5b5c950b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -51,6 +51,11 @@ internal class ParallelRangeDataSource(
+         private const val TAG = "ParallelRangeDS"
+         private const val READ_BUFFER_SIZE = 64 * 1024
+ 
++        // Memory: 272 lazily-spawned workers at the default 1 MB stack reservation
++        // overcommit ~270 MB of address space and tens of MB resident for stacks that
++        // never nest deep; 512 KB is ample for chunk copy loops and halves both.
++        private const val WORKER_THREAD_STACK_BYTES = 512L * 1024L
++
+         private const val BOOTSTRAP_READ_BYTES = 256L * 1024L
+ 
+         private const val IN_FLIGHT_WAIT_CAP_MS = 3_000L
+@@ -84,7 +89,7 @@ internal class ParallelRangeDataSource(
+         // deepest legal window, and threads spawn lazily on smaller configurations.
+         private val sharedExecutor: ExecutorService by lazy {
+             val threadFactory = ThreadFactory { runnable ->
+-                Thread(runnable, "parallel-ds-worker").apply {
++                Thread(runnable, "parallel-ds-worker", WORKER_THREAD_STACK_BYTES).apply {
+                     priority = Thread.NORM_PRIORITY
+                     isDaemon = true
+                 }
+@@ -102,6 +107,28 @@ internal class ParallelRangeDataSource(
+         private val activeInstances = java.util.concurrent.atomic.AtomicInteger(0)
+         private val globalBufferPool = ConcurrentHashMap<Long, ConcurrentLinkedDeque<PooledBuffer>>()
+ 
++        // P4: bounded drain so a cancelled-almost-done response body still returns its
++        // socket to the pool (okhttp reuses only fully-read bodies). Best-effort and
++        // bounded by MemoryBudget.CANCEL_DRAIN_MAX_BYTES: larger remainders are closed,
++        // since draining them would waste exactly the per-connection bandwidth the
++        // throttle allots.
++        private fun drainForSocketReuse(ds: DataSource, expectedBytes: Long, totalRead: Int) {
++            if (expectedBytes <= 0L) return
++            val remaining = expectedBytes - totalRead
++            if (!com.nuvio.tv.ui.screens.settings.MemoryBudget.shouldDrainForReuse(remaining)) return
++            try {
++                Thread.interrupted() // clear a pending cancel interrupt so reads proceed
++                val scratch = readBufferLocal.get() ?: return
++                var left = remaining
++                while (left > 0L) {
++                    val r = ds.read(scratch, 0, minOf(left, scratch.size.toLong()).toInt())
++                    if (r == C.RESULT_END_OF_INPUT || r <= 0) break
++                    left -= r
++                }
++            } catch (_: Exception) {
++            }
++        }
++
+         private fun freeDirectBuffer(buffer: ByteBuffer) {
+             if (!buffer.isDirect) return
+             try {
+@@ -174,6 +201,73 @@ internal class ParallelRangeDataSource(
+             return (hudNextStepAtMs - nowUptimeMs).coerceAtLeast(0L)
+         }
+ 
++        // P1/P2: hard concurrency gate with a dynamic AIMD ceiling. Every window chunk
++        // download acquires a permit; the ceiling starts at the configured connection
++        // count, is halved (floored at MemoryBudget.aimdGateFloor) on 429 episodes and
++        // recovered additively while quiet — replacing the depth-halving collapse that
++        // pinned throughput to 1-2 connections for minutes. Waiters recheck the ceiling
++        // on every release, so a seek's fresh chunks are not starved behind the backlog.
++        private class ConnectionGate(initialConnections: Int) {
++            private val lock = Object()
++            private var maxPermits = initialConnections.coerceAtLeast(1)
++            private var ceiling = maxPermits
++            private var inUse = 0
++
++            fun acquire() {
++                synchronized(lock) {
++                    while (inUse >= ceiling) lock.wait()
++                    inUse++
++                }
++            }
++
++            fun release() {
++                synchronized(lock) {
++                    if (inUse > 0) inUse--
++                    lock.notifyAll()
++                }
++            }
++
++            /** Multiplicative decrease on a 429 episode; returns the new ceiling. */
++            fun onRateLimited(): Int {
++                synchronized(lock) {
++                    val target = com.nuvio.tv.ui.screens.settings.MemoryBudget.aimdDecreaseGate(ceiling, maxPermits)
++                    if (target < ceiling) {
++                        ceiling = target
++                        lock.notifyAll()
++                    }
++                    return ceiling
++                }
++            }
++
++            /** Additive increase while rate-limit quiet; returns the new ceiling. */
++            fun recover(): Int {
++                synchronized(lock) {
++                    ceiling = com.nuvio.tv.ui.screens.settings.MemoryBudget.aimdIncreaseGate(ceiling, maxPermits)
++                    lock.notifyAll()
++                    return ceiling
++                }
++            }
++
++            fun isThrottled(): Boolean {
++                synchronized(lock) { return ceiling < maxPermits }
++            }
++
++            fun maxPermits(): Int {
++                synchronized(lock) { return maxPermits }
++            }
++
++            /** Config raised between plays: grow the budget, keep an active clamp intact. */
++            fun expandMax(connections: Int) {
++                synchronized(lock) {
++                    if (connections <= maxPermits) return
++                    val wasAtMax = ceiling == maxPermits
++                    maxPermits = connections
++                    if (wasAtMax) ceiling = maxPermits
++                    lock.notifyAll()
++                }
++            }
++        }
++
+         private class ChunkSession(
+             val requestUri: Uri,
+ 
+@@ -181,7 +275,8 @@ internal class ParallelRangeDataSource(
+             val chunkSize: Long,
+             val chunkCap: Int,
+ 
+-            val prefetchWindow: Int
++            val prefetchWindow: Int,
++            connections: Int
+         ) {
+             @Volatile var resolvedUri: Uri? = null
+             @Volatile var totalLength: Long = -1L
+@@ -199,6 +294,12 @@ internal class ParallelRangeDataSource(
+             val rateLimitEscalation = AtomicInteger(0)
+             val activeSources: MutableSet<DataSource> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+ 
++            // P1/P2: session-owned connection gate — warm-session adoption keeps a
++            // stable server-facing connection budget across player instances.
++            val connectionGate = ConnectionGate(connections)
++            @Volatile var lastGateStepAtMs: Long = 0L
++            @Volatile var hudGateCeiling: Int = 0
++
+             val inFlight = ConcurrentHashMap<Long, InFlightChunk>()
+             @Volatile var lastUsedAtMs: Long = SystemClock.uptimeMillis()
+ 
+@@ -248,7 +349,12 @@ internal class ParallelRangeDataSource(
+                 if (now - lastDepthHalveAtMs >= 1_000L) {
+                     val alreadyCapped = rateLimitDepthCap.get() < configuredDepth
+                     val effective = rateLimitDepthCap.get().coerceAtMost(configuredDepth)
+-                    val halved = (effective / 2).coerceAtLeast(1)
++                    // P2: the depth cap may shrink under load but never below 1/8 of the
++                    // configured window (min 16 chunks) — with the gate limiting real
++                    // connections, a near-empty window only starves scheduling.
++                    val halved = (effective / 2).coerceAtLeast(
++                        com.nuvio.tv.ui.screens.settings.MemoryBudget.rateLimitDepthFloor(configuredDepth)
++                    )
+                     if (halved < effective) {
+                         rateLimitDepthCap.set(halved)
+                         lastDepthHalveAtMs = now
+@@ -266,6 +372,15 @@ internal class ParallelRangeDataSource(
+                             "$halved/$configuredDepth (probe interval ${depthStepIntervalMs}ms)")
+                     }
+                 }
++                // P2: the PRIMARY 429 lever is the connection gate ceiling — the actual
++                // number of concurrent connections. Multiplicative decrease, floored so
++                // parallelism survives the episode (see MemoryBudget AIMD).
++                val gateCeiling = connectionGate.onRateLimited()
++                if (gateCeiling < connectionGate.maxPermits()) {
++                    hudGateCeiling = gateCeiling
++                    Log.w(TAG, "Rate-limited; connection gate ceiling -> " +
++                        "$gateCeiling/${connectionGate.maxPermits()}")
++                }
+                 return escalation
+             }
+ 
+@@ -275,7 +390,9 @@ internal class ParallelRangeDataSource(
+                 val now = SystemClock.uptimeMillis()
+                 if (now - lastRateLimitAtMs >= depthStepIntervalMs &&
+                     now - lastDepthStepAtMs >= depthStepIntervalMs) {
+-                    val stepped = cap + 1
++                    // P2: proportional recovery (+1/8 of the window) instead of the old
++                    // +1 per interval, so a clamped window is fully restored in <= 8 steps.
++                    val stepped = cap + com.nuvio.tv.ui.screens.settings.MemoryBudget.rateLimitDepthStep(configuredDepth)
+                     if (rateLimitDepthCap.compareAndSet(cap, stepped)) {
+                         lastDepthStepAtMs = now
+                         rateLimitEscalation.updateAndGet { (it - 1).coerceAtLeast(0) }
+@@ -295,6 +412,28 @@ internal class ParallelRangeDataSource(
+                 }
+                 return rateLimitDepthCap.get().coerceAtMost(configuredDepth)
+             }
++
++            /**
++             * P2: additive recovery of the connection gate ceiling while the session is
++             * rate-limit quiet. Driven from scheduleChunks (read path), mirroring the
++             * depth-cap stepping cadence.
++             */
++            fun recoverGateIfQuiet() {
++                if (!connectionGate.isThrottled()) return
++                val now = SystemClock.uptimeMillis()
++                if (now - lastRateLimitAtMs >= depthStepIntervalMs &&
++                    now - lastGateStepAtMs >= depthStepIntervalMs) {
++                    val stepped = connectionGate.recover()
++                    lastGateStepAtMs = now
++                    if (!connectionGate.isThrottled()) {
++                        hudGateCeiling = 0
++                        Log.i(TAG, "Rate-limit quiet; connection gate fully restored to ${connectionGate.maxPermits()}")
++                    } else {
++                        hudGateCeiling = stepped
++                        Log.i(TAG, "Rate-limit quiet; connection gate ceiling -> $stepped/${connectionGate.maxPermits()}")
++                    }
++                }
++            }
+         }
+ 
+         private val sessionLock = Any()
+@@ -361,7 +500,8 @@ internal class ParallelRangeDataSource(
+             chunkSz: Long,
+             chunkCap: Int,
+             poolCap: Int,
+-            prefetchWindow: Int
++            prefetchWindow: Int,
++            connections: Int
+         ): ChunkSession {
+             synchronized(sessionLock) {
+                 val existing = currentChunkSession
+@@ -372,6 +512,8 @@ internal class ParallelRangeDataSource(
+                         existing.requestHeaders == requestHeaders
+                     ) {
+                         existing.lastUsedAtMs = SystemClock.uptimeMillis()
++                        // Config raised between plays: grow the shared gate budget.
++                        existing.connectionGate.expandMax(connections)
+                         return existing
+                     }
+                     teardownSessionLocked(existing, poolCap)
+@@ -427,7 +569,7 @@ internal class ParallelRangeDataSource(
+                 hudNextStepAtMs = 0L
+                 hudHedgeRestarts = 0
+                 hudHedgeExhausted = false
+-                val created = ChunkSession(requestUri, requestHeaders, chunkSz, chunkCap, prefetchWindow)
++                val created = ChunkSession(requestUri, requestHeaders, chunkSz, chunkCap, prefetchWindow, connections)
+                 currentChunkSession = created
+                 return created
+             }
+@@ -449,7 +591,8 @@ internal class ParallelRangeDataSource(
+             chunkSz: Long,
+             chunkCap: Int,
+             poolCap: Int,
+-            prefetchWindow: Int
++            prefetchWindow: Int,
++            connections: Int
+         ): ChunkSession? {
+             synchronized(sessionLock) {
+                 val live = currentChunkSession
+@@ -467,7 +610,7 @@ internal class ParallelRangeDataSource(
+                     }
+                     teardownSessionLocked(existingPending, poolCap)
+                 }
+-                val created = ChunkSession(requestUri, requestHeaders, chunkSz, chunkCap, prefetchWindow)
++                val created = ChunkSession(requestUri, requestHeaders, chunkSz, chunkCap, prefetchWindow, connections)
+                 pendingChunkSession = created
+                 return created
+             }
+@@ -587,13 +730,8 @@ internal class ParallelRangeDataSource(
+ 
+     private val maxPoolSize = effectivePrefetchDepth + 2
+ 
+-    // Hard concurrency ceiling for window chunk downloads: the connection count setting
+-    // becomes the real cap. Without the gate the fill loop submits depth futures at once
+-    // and the executor core — not the setting — decides how many sockets actually open
+-    // (the "64 connections shows 80+" overage). Fair so a seek's fresh chunks are not
+-    // starved behind the backlog; the reader's continuation connection stays outside.
+-    private val connectionGate =
+-        java.util.concurrent.Semaphore(parallelConnections.coerceAtLeast(1), true)
++    // (The hard concurrency gate moved into ChunkSession — P1/P2 — so warm-session
++    // adoption keeps one stable server-facing connection budget per stream.)
+ 
+     private var currentChunk: DownloadedChunk? = null
+     private var currentChunkIndex: Long = -1
+@@ -685,7 +823,7 @@ internal class ParallelRangeDataSource(
+         resetLocalReadState()
+         bytesServedThisOpen = 0L
+ 
+-        val attachedSession = obtainSession(dataSpec.uri, dataSpec.httpRequestHeaders, chunkSize, sessionChunkCap, maxPoolSize, effectivePrefetchDepth)
++        val attachedSession = obtainSession(dataSpec.uri, dataSpec.httpRequestHeaders, chunkSize, sessionChunkCap, maxPoolSize, effectivePrefetchDepth, parallelConnections)
+         session = attachedSession
+         val warmLength = attachedSession.totalLength
+         if (warmLength > 0L && dataSpec.position in 0 until warmLength) {
+@@ -1182,6 +1320,9 @@ internal class ParallelRangeDataSource(
+         val maxAhead = session?.currentAllowedDepth(effectivePrefetchDepth)?.coerceAtMost(earnedAhead)
+             ?: earnedAhead
+ 
++        // P2: additive recovery of the connection gate ceiling while rate-limit quiet.
++        session?.recoverGateIfQuiet()
++
+         for (i in 0 until maxAhead) {
+             val ci = currentChunkIdx + i
+             if (totalFileLength != C.LENGTH_UNSET.toLong() && ci * chunkSize >= totalFileLength) break
+@@ -1206,7 +1347,7 @@ internal class ParallelRangeDataSource(
+                     return@execute
+                 }
+                 try {
+-                    connectionGate.acquire()
++                    activeSession.connectionGate.acquire()
+                 } catch (e: InterruptedException) {
+                     future.completeExceptionally(e)
+                     Thread.currentThread().interrupt()
+@@ -1232,7 +1373,7 @@ internal class ParallelRangeDataSource(
+                         IOException("Native chunk buffer allocation failed (out of memory)", e)
+                     )
+                 } finally {
+-                    connectionGate.release()
++                    activeSession.connectionGate.release()
+                 }
+             }
+             future
+@@ -1498,6 +1639,8 @@ internal class ParallelRangeDataSource(
+ 
+             while (!activeSession.abandoned.get()) {
+                 if (future.isCancelled) {
++                    // P4: bounded drain before abandoning keeps the socket reusable.
++                    drainForSocketReuse(ds, expectedBytes, totalRead)
+                     throw IOException("Chunk download cancelled")
+                 }
+                 val maxRead = minOf(buffer.byteBuffer.capacity() - totalRead, READ_BUFFER_SIZE)
+@@ -1562,10 +1705,16 @@ internal class ParallelRangeDataSource(
+             }
+         } catch (e: Exception) {
+             releaseInFlightBuffer(activeSession, chunkIndex, inFlight, buffer)
+-            if (activeSession.abandoned.get()) throw IOException("Session abandoned")
++            if (activeSession.abandoned.get() || future.isCancelled) {
++                // P4: bounded drain before teardown keeps the socket reusable.
++                drainForSocketReuse(ds, expectedBytes, totalRead)
++                throw IOException("Session abandoned")
++            }
+             throw e
+         }
+         if (activeSession.abandoned.get()) {
++            // P4: bounded drain before teardown keeps the socket reusable.
++            drainForSocketReuse(ds, expectedBytes, totalRead)
+             releaseInFlightBuffer(activeSession, chunkIndex, inFlight, buffer)
+             throw IOException("Session abandoned")
+         }
+@@ -1809,7 +1958,7 @@ internal class ParallelRangeDataSource(
+ 
+     internal fun prestartChunk0(uri: Uri) {
+         val pending = obtainPendingSession(
+-            uri, emptyMap(), chunkSize, sessionChunkCap, maxPoolSize, effectivePrefetchDepth
++            uri, emptyMap(), chunkSize, sessionChunkCap, maxPoolSize, effectivePrefetchDepth, parallelConnections
+         ) ?: return
+         session = pending
+         try {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+index 7d97b2e2..5db5d1a9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+@@ -263,6 +263,55 @@ object MemoryBudget {
+         return maxOf(HEDGE_STALL_FLOOR_BPS, median / 4L)
+     }
+ 
++    // ─── P2: gate-based AIMD (connection-count control during 429 episodes) ────
++    //
++    // The 64-era depth clamp halved the prefetch window toward 1 chunk and recovered
++    // +1 per 10-60 s: at high connection counts that collapsed throughput to 1-2
++    // connections for minutes. With the hard connection gate in place the depth cap
++    // only limits queued work, so 429 backoff now acts on the GATE ceiling — the
++    // actual number of concurrent connections — with multiplicative decrease and
++    // additive increase, both floored/capped so parallelism never dies completely.
++    // Full recovery takes <= 16 steps at the base step interval.
++
++    /** AIMD decrease floor: 1/16 of the configured count, at least 8, never above it. */
++    fun aimdGateFloor(connections: Int): Int =
++        (connections / 16).coerceAtLeast(8).coerceAtMost(connections.coerceAtLeast(1))
++
++    /** Multiplicative decrease: halve the ceiling, floored at [aimdGateFloor]. */
++    fun aimdDecreaseGate(ceiling: Int, connections: Int): Int =
++        (ceiling / 2).coerceAtLeast(aimdGateFloor(connections))
++
++    /** Additive increase: +1/16 of the configured count per quiet step, capped at it. */
++    fun aimdIncreaseGate(ceiling: Int, connections: Int): Int =
++        (ceiling + (connections / 16).coerceAtLeast(1)).coerceAtMost(connections)
++
++    /**
++     * Depth-cap floor during 429 episodes. The window may shrink under load but never
++     * below 1/8 of its configured size (min 16 chunks): with the gate limiting real
++     * connections, a near-empty window only starves scheduling without reducing
++     * server-facing load any further.
++     */
++    fun rateLimitDepthFloor(configuredDepth: Int): Int =
++        (configuredDepth / 8).coerceAtLeast(16).coerceAtMost(configuredDepth)
++
++    /** Depth-cap recovery step: proportional (+1/8) instead of the old +1 per interval. */
++    fun rateLimitDepthStep(configuredDepth: Int): Int =
++        (configuredDepth / 8).coerceAtLeast(1)
++
++    // ─── P4: bounded cancel drain ──────────────────────────────────────────────
++    //
++    // okhttp only returns a connection to the pool when the response body has been
++    // read to the end. Cancelling a chunk download mid-body therefore kills the
++    // socket — and after a seek, ALL in-flight chunks cancel at once, forcing the
++    // refill through cold re-handshakes. Draining a NEARLY-complete body (<= 64 KB)
++    // is cheap (about a second even at 0.5 Mbps) and keeps the socket warm; larger
++    // remainders are closed instead, since draining them would waste exactly the
++    // per-connection bandwidth the throttle allots.
++    const val CANCEL_DRAIN_MAX_BYTES = 64L * 1024L
++
++    fun shouldDrainForReuse(remainingBytes: Long): Boolean =
++        remainingBytes in 1..CANCEL_DRAIN_MAX_BYTES
++
+     /** Max chunk size that fits budget given current buffer size */
+     fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
+         ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
+-- 
+2.47.3
+
+
+From 4de70b2c7fb00ac68819bdfe46b21404b0f4edbc Mon Sep 17 00:00:00 2001
+From: sim <sim@local>
+Date: Thu, 19 Nov 2026 04:58:33 +0000
+Subject: [PATCH 6/6] Wire playback clients to the shared connection pool +
+ AIMD/drain ledger tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+P3 (pool): playbackHttpClient and trustAllPlaybackHttpClient never had the
+shared 512-idle pool wired in — applyNetworkOptimizations only covers the
+createHttpClient derivative, while the chunk engine (OkHttpDataSource in
+PlayerMediaSourceFactory) and StreamSpeedTester use playbackHttpClient
+DIRECTLY. The whole 256-way window therefore ran on okhttp's default
+5-idle pool: every completed chunk could evict a live connection and force
+a cold TCP/TLS re-handshake — the single biggest rate destabilizer at high
+connection counts. Both builders now set the shared pool explicitly.
+
+Tests: 5 new ledger tests (19 total in MemoryBudgetParallel256Test) —
+AIMD gate floor by connection count, halve-but-never-die decrease path,
+proportional recovery within 16 steps, depth-cap floor/step, and the
+64 KB bounded cancel-drain budget. All 29 tests (19 + 10 legacy) pass
+against the real production MemoryBudget source.
+---
+ .../player/PlayerPlaybackNetworking.kt        |  7 ++
+ .../settings/MemoryBudgetParallel256Test.kt   | 81 +++++++++++++++++++
+ 2 files changed, 88 insertions(+)
+
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+index 35445806..ac43c40a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+@@ -52,6 +52,7 @@ internal object PlayerPlaybackNetworking {
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
++            .connectionPool(NuvioExoPlayerPerformanceHelper.sharedConnectionPool)
+             .dns(IPv4FirstDns())
+             .socketFactory(PlaybackSocketFactory)
+             .eventListenerFactory(PlaybackConnectionEvents)
+@@ -80,6 +81,12 @@ internal object PlayerPlaybackNetworking {
+         }
+         OkHttpClient.Builder()
+             .dispatcher(dispatcher)
++            // P3: the chunk engine (OkHttpDataSource.Factory) and StreamSpeedTester use
++            // THIS client directly, so the shared 512-idle pool must be wired here —
++            // applyNetworkOptimizations only covers the createHttpClient derivative.
++            // On the default 5-idle pool, a 256-way window churned cold sockets after
++            // every completed chunk.
++            .connectionPool(NuvioExoPlayerPerformanceHelper.sharedConnectionPool)
+             .dns(IPv4FirstDns())
+             .socketFactory(PlaybackSocketFactory)
+             .eventListenerFactory(PlaybackConnectionEvents)
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+index c42e5566..6ce66de5 100644
+--- a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+@@ -5,6 +5,7 @@ package com.nuvio.tv.ui.screens.settings
+ import androidx.annotation.OptIn
+ import androidx.media3.common.util.UnstableApi
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -156,4 +157,84 @@ class MemoryBudgetParallel256Test {
+     fun testHedgeFloorConstant() {
+         assertEquals(16L * kb, MemoryBudget.HEDGE_STALL_FLOOR_BPS)
+     }
++
++    // ── P2: gate-based AIMD ───────────────────────────────────────────────────
++
++    @Test
++    fun testAimdGateFloorByConnectionCount() {
++        // 1/16 of the configured count, at least 8, never above it.
++        assertEquals(16, MemoryBudget.aimdGateFloor(256))
++        assertEquals(8, MemoryBudget.aimdGateFloor(64))
++        assertEquals(8, MemoryBudget.aimdGateFloor(16))
++        assertEquals(8, MemoryBudget.aimdGateFloor(8))
++        assertEquals(4, MemoryBudget.aimdGateFloor(4))
++        assertEquals(2, MemoryBudget.aimdGateFloor(2))
++    }
++
++    @Test
++    fun testAimdDecreaseHalvesButNeverDies() {
++        // Multiplicative decrease from full: 256 -> 128 -> 64 -> 32 -> 16, then the
++        // floor holds — the 64-era depth clamp instead walked to 1 and pinned
++        // throughput there for minutes.
++        var ceiling = 256
++        ceiling = MemoryBudget.aimdDecreaseGate(ceiling, 256)
++        assertEquals(128, ceiling)
++        ceiling = MemoryBudget.aimdDecreaseGate(ceiling, 256)
++        assertEquals(64, ceiling)
++        ceiling = MemoryBudget.aimdDecreaseGate(ceiling, 256)
++        assertEquals(32, ceiling)
++        ceiling = MemoryBudget.aimdDecreaseGate(ceiling, 256)
++        assertEquals(16, ceiling)
++        ceiling = MemoryBudget.aimdDecreaseGate(ceiling, 256)
++        assertEquals(16, ceiling)
++        assertEquals(16, MemoryBudget.aimdDecreaseGate(16, 256))
++    }
++
++    @Test
++    fun testAimdIncreaseRecoversProportionally() {
++        // +1/16 of the configured count per quiet step, capped at it: full recovery
++        // from the 256-tier floor takes 15 steps, not the 240 single steps (+1 each,
++        // 10-60 s apart) the 64-era depth stepper needed.
++        assertEquals(32, MemoryBudget.aimdIncreaseGate(16, 256))
++        assertEquals(256, MemoryBudget.aimdIncreaseGate(240, 256))
++        assertEquals(256, MemoryBudget.aimdIncreaseGate(256, 256))
++        assertEquals(12, MemoryBudget.aimdIncreaseGate(8, 64))
++        var ceiling = 16
++        var steps = 0
++        while (ceiling < 256 && steps < 32) {
++            ceiling = MemoryBudget.aimdIncreaseGate(ceiling, 256)
++            steps++
++        }
++        assertEquals(256, ceiling)
++        assertTrue(steps in 1..16)
++    }
++
++    @Test
++    fun testRateLimitDepthFloorAndStep() {
++        // Depth cap floors at 1/8 of the window (min 16): the window may shrink under
++        // a 429 storm but never starves scheduling outright; recovery is +1/8 per step.
++        assertEquals(21, MemoryBudget.rateLimitDepthFloor(175))
++        assertEquals(16, MemoryBudget.rateLimitDepthFloor(100))
++        assertEquals(12, MemoryBudget.rateLimitDepthFloor(12))
++        assertEquals(59, MemoryBudget.rateLimitDepthFloor(475))
++        assertEquals(21, MemoryBudget.rateLimitDepthStep(175))
++        assertEquals(59, MemoryBudget.rateLimitDepthStep(475))
++        assertEquals(1, MemoryBudget.rateLimitDepthStep(12))
++    }
++
++    // ── P4: bounded cancel drain ──────────────────────────────────────────────
++
++    @Test
++    fun testCancelDrainBudget() {
++        // Nearly-complete bodies (<= 64 KB remaining) are drained so the socket returns
++        // to the pool; anything larger is closed instead of wasting throttled
++        // per-connection bandwidth on discarded bytes.
++        assertTrue(MemoryBudget.shouldDrainForReuse(1L))
++        assertTrue(MemoryBudget.shouldDrainForReuse(64L * kb))
++        assertFalse(MemoryBudget.shouldDrainForReuse(0L))
++        assertFalse(MemoryBudget.shouldDrainForReuse(-1L))
++        assertFalse(MemoryBudget.shouldDrainForReuse(64L * kb + 1L))
++        assertFalse(MemoryBudget.shouldDrainForReuse(mb))
++        assertEquals(64L * kb, MemoryBudget.CANCEL_DRAIN_MAX_BYTES)
++    }
+ }
+-- 
+2.47.3
+

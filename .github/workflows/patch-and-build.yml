@@ -1,8 +1,14 @@
-name: Patch & Build (64-conn)
+name: Patch & Build (256-conn dev)
 
-# Applies nuviotv-64conn.patch to the official NuvioMedia/NuvioTV repository,
+# Applies nuviotv-256conn.patch to the official NuvioMedia/NuvioTV repository,
 # verifies the patch invariants, builds the APK, and unit-tests the patched
 # app AGAINST an unpatched baseline run of the same suite.
+#
+# The patch is authored against pristine upstream dev @ 48d6449 (same model as
+# the 64-conn patch): commit 1 is the original 64-connection mod, commits 2-6
+# are the 256 tier. One `git am` applies everything; no patch chaining and no
+# dependency on the main branch's nuviotv-64conn.patch (this patch supersedes
+# it).
 #
 # Job map:
 #   patch-verify-build   apply + verify + assembleFullDebug -> APK artifact
@@ -14,9 +20,8 @@ name: Patch & Build (64-conn)
 # Pre-existing upstream test failures fail on BOTH sides and are tolerated
 # (upstream's own CI only runs com.nuvio.tv.updater.* for the same reason).
 #
-# Tested baselines (patch applies cleanly with git am --3way):
+# Tested baseline (patch applies cleanly with git am --3way):
 #   - dev  @ 48d6449  (default branch tip, the patch's authored base)
-#   - main @ 7327eabf (release branch tip)
 
 on:
   workflow_dispatch:
@@ -28,13 +33,13 @@ on:
   push:
     branches: ['**']
     paths:
-      - 'nuviotv-64conn.patch'
+      - 'nuviotv-256conn.patch'
       - 'verify-patch.sh'
       - 'compare-tests.py'
       - '.github/workflows/patch-and-build.yml'
   pull_request:
     paths:
-      - 'nuviotv-64conn.patch'
+      - 'nuviotv-256conn.patch'
       - 'verify-patch.sh'
       - 'compare-tests.py'
       - '.github/workflows/patch-and-build.yml'
@@ -43,12 +48,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: patch-build-${{ github.ref }}
+  group: patch-build-256-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   patch-verify-build:
-    name: Apply patch, verify, build APK
+    name: Apply 256-connection patch, verify, build APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout upstream NuvioTV (${{ inputs.upstream_ref || 'dev' }})
@@ -65,11 +70,12 @@ jobs:
         with:
           path: mod
 
-      - name: Apply 64-connection patch
+      - name: Apply 256-connection patch
         run: |
           git config user.name "patch-ci"
           git config user.email "patch-ci@users.noreply.github.com"
-          git am --3way mod/nuviotv-64conn.patch
+          echo "UPSTREAM_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          git am --3way mod/nuviotv-256conn.patch
           echo "Patched HEAD: $(git log --oneline -1)"
 
       - name: Verify patch invariants
@@ -112,24 +118,24 @@ jobs:
 
       # Stamp the APK and artifact names with the OFFICIAL versionName from
       # app/build.gradle.kts (identical to what an official build of the same
-      # ref reports in Settings) plus the upstream base commit, so every
-      # rerun shows which official release the APK is based on.
-      # HEAD is the patch commit; HEAD~1 is the pristine upstream ref.
+      # ref reports in Settings) plus the pristine upstream base commit
+      # (captured BEFORE the patch was applied), so every rerun shows which
+      # official release the APK is based on.
       - name: Stamp official version into artifact names
         run: |
           VERSION_NAME=$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)
           if [ -z "$VERSION_NAME" ]; then
-            VERSION_NAME=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo unknown)
+            VERSION_NAME=$(git describe --tags --abbrev=0 "$UPSTREAM_SHA" 2>/dev/null || echo unknown)
           fi
-          BASE_SHA=$(git rev-parse --short HEAD~1)
-          APK_BASE="NuvioTV-${VERSION_NAME}-64conn-${BASE_SHA}"
+          APK_BASE="NuvioTV-${VERSION_NAME}-256conn-${UPSTREAM_SHA}"
           echo "APK_BASE=$APK_BASE" >> "$GITHUB_ENV"
           mv app/build/outputs/apk/full/debug/app-full-universal-debug.apk \
              "app/build/outputs/apk/full/debug/${APK_BASE}-full-universal-debug.apk"
           {
-            echo "## Patched APK version stamp"
+            echo "## Patched APK version stamp (256-conn dev)"
             echo "- Official versionName: **${VERSION_NAME}**"
-            echo "- Upstream base: ${BASE_SHA} (ref: ${{ inputs.upstream_ref || 'dev' }})"
+            echo "- Pristine upstream base: ${UPSTREAM_SHA} (ref: ${{ inputs.upstream_ref || 'dev' }})"
+            echo "- Patch: nuviotv-256conn.patch (6 commits: 64-conn mod + 256 tier)"
             echo "- Artifact: \`${APK_BASE}-full-debug-apk\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -158,11 +164,11 @@ jobs:
         with:
           path: mod
 
-      - name: Apply 64-connection patch
+      - name: Apply 256-connection patch
         run: |
           git config user.name "patch-ci"
           git config user.email "patch-ci@users.noreply.github.com"
-          git am --3way mod/nuviotv-64conn.patch
+          git am --3way mod/nuviotv-256conn.patch
 
       - name: Verify patch invariants
         run: bash mod/verify-patch.sh
@@ -282,7 +288,7 @@ jobs:
           retention-days: 7
 
   test-verdict:
-    name: Test verdict (patch vs baseline)
+    name: Test verdict (patched vs baseline)
     needs: [unit-tests-patched, unit-tests-baseline]
     runs-on: ubuntu-latest
     steps:

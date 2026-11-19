@@ -1,4 +1,4 @@
-From 14fe14833db6705e56c2f121b2c722238f6c39d8 Mon Sep 17 00:00:00 2001
+From c4eaafa73ddc26308d95c54781907772a12fd994 Mon Sep 17 00:00:00 2001
 From: sim <sim@example.com>
 Date: Tue, 17 Nov 2026 15:05:03 +0000
 Subject: [PATCH 1/6] Raise parallel connection cap to 64 (native tier) with
@@ -40,7 +40,7 @@ wired at all three sites. Ledger tests pin the real RAM tiers
  create mode 100644 app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
 
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
-index a7d8946f..7fa4405c 100644
+index a7d8946f5..7fa4405c2 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 @@ -491,6 +491,10 @@ data class PlayerSettings(
@@ -82,7 +82,7 @@ index a7d8946f..7fa4405c 100644
              }
              parallelChunkSizeKb?.let {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
-index 11da9371..54886d5f 100644
+index 4688e4319..340bf7fad 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 @@ -62,8 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
@@ -94,11 +94,11 @@ index 11da9371..54886d5f 100644
 +    // live chunk connections mid playback and forcing cold reopens. Sized at 2x the 64-connection
 +    // cap (aria2-aligned) so a full window returns its sockets to the pool instead of churning.
 +    const val NUVIO_SHARED_POOL_MAX_IDLE = 128
-     private const val BACK_BUFFER_TARGET_SHARE_NUM = 1L
-     private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
  
+     // ─── Customization Variables ──────────────────────────────────────────────
+     @Volatile
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index b46d099d..09d13935 100644
+index b46d099db..09d139359 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 @@ -75,6 +75,10 @@ internal class ParallelRangeDataSource(
@@ -176,7 +176,7 @@ index b46d099d..09d13935 100644
  
      private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-index 9d91a894..241baa78 100644
+index 9d91a894a..241baa785 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 @@ -146,10 +146,16 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
@@ -271,10 +271,10 @@ index 9d91a894..241baa78 100644
          private const val MIME_PROBE_CACHE_SIZE = 64
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-index ebc06ae3..7a832dc4 100644
+index e7d7b196e..2b94eb32c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-@@ -44,8 +44,11 @@ internal object PlayerPlaybackNetworking {
+@@ -50,8 +50,11 @@ internal object PlayerPlaybackNetworking {
       */
      internal val trustAllPlaybackHttpClient: OkHttpClient by lazy {
          val dispatcher = okhttp3.Dispatcher().apply {
@@ -288,7 +288,7 @@ index ebc06ae3..7a832dc4 100644
          }
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
-@@ -71,8 +74,9 @@ internal object PlayerPlaybackNetworking {
+@@ -77,8 +80,9 @@ internal object PlayerPlaybackNetworking {
       */
      internal val playbackHttpClient: OkHttpClient by lazy {
          val dispatcher = okhttp3.Dispatcher().apply {
@@ -301,7 +301,7 @@ index ebc06ae3..7a832dc4 100644
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
-index 02fa22a8..7230fb04 100644
+index 02fa22a86..7230fb04f 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 @@ -34,6 +34,10 @@ object MemoryBudget {
@@ -363,7 +363,7 @@ index 02fa22a8..7230fb04 100644
      fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
          ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
-index d017af43..6395de08 100644
+index d017af431..6395de088 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 @@ -345,6 +345,8 @@ private fun ParallelNetworkControls(
@@ -409,10 +409,10 @@ index d017af43..6395de08 100644
              MemoryBudget.maxChunkMb(
                  MemoryBudget.effectiveBufferMb(settings.bufferSettings.targetBufferSizeMb),
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 5906b595..c67b021b 100644
+index 3bf8175b5..7f9271b96 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -3367,7 +3367,7 @@
+@@ -3376,7 +3376,7 @@
      <string name="playback_net_parallel">Parallel Connections</string>
      <string name="playback_net_parallel_sub">Use multiple connections in parallel for fetching streams. Activate when you experience buffering although your download speed is definitely more than sufficient.</string>
      <string name="playback_net_connection_count">Connection Count</string>
@@ -423,7 +423,7 @@ index 5906b595..c67b021b 100644
  
 diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
 new file mode 100644
-index 00000000..d583163b
+index 000000000..d583163bc
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetNativeChunkBudgetTest.kt
 @@ -0,0 +1,165 @@
@@ -596,7 +596,7 @@ index 00000000..d583163b
 2.47.3
 
 
-From 5ebe92efba0cf9092d6fb76be4a28fb987702557 Mon Sep 17 00:00:00 2001
+From 82a2c3772b9e47466580638aa0251cb52765db20 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:08 +0000
 Subject: [PATCH 2/6] Raise parallel connection cap to 256 with byte-accurate
@@ -641,7 +641,7 @@ Strings: connection-count subtitle updated to the 256-era semantics
  7 files changed, 131 insertions(+), 25 deletions(-)
 
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
-index 7fa4405c..7eea75d3 100644
+index 7fa4405c2..7eea75d34 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
 @@ -494,7 +494,13 @@ data class PlayerSettings(
@@ -660,7 +660,7 @@ index 7fa4405c..7eea75d3 100644
          const val MAX_PARALLEL_CHUNK_SIZE_KB = 128 * 1024
          const val DEFAULT_ENABLE_HTTP2 = false
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
-index 54886d5f..4a635462 100644
+index 340bf7fad..6339ef774 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 @@ -62,9 +62,9 @@ object NuvioExoPlayerPerformanceHelper {
@@ -672,11 +672,11 @@ index 54886d5f..4a635462 100644
      // cap (aria2-aligned) so a full window returns its sockets to the pool instead of churning.
 -    const val NUVIO_SHARED_POOL_MAX_IDLE = 128
 +    const val NUVIO_SHARED_POOL_MAX_IDLE = 512
-     private const val BACK_BUFFER_TARGET_SHARE_NUM = 1L
-     private const val BACK_BUFFER_TARGET_SHARE_DEN = 2L
  
+     // ─── Customization Variables ──────────────────────────────────────────────
+     @Volatile
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-index 241baa78..89e3fe72 100644
+index 241baa785..89e3fe729 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 @@ -145,17 +145,18 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
@@ -771,10 +771,10 @@ index 241baa78..89e3fe72 100644
                      sessionConnections,
                      com.nuvio.tv.ui.screens.settings.MemoryBudget.nativeChunkBudgetMb(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-index 7a832dc4..35445806 100644
+index 2b94eb32c..2c7f24309 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-@@ -46,9 +46,9 @@ internal object PlayerPlaybackNetworking {
+@@ -52,9 +52,9 @@ internal object PlayerPlaybackNetworking {
          val dispatcher = okhttp3.Dispatcher().apply {
              // OkHttpDataSource issues synchronous calls, which the dispatcher does not
              // throttle; the limits only matter if a future media3/okhttp version switches
@@ -787,7 +787,7 @@ index 7a832dc4..35445806 100644
          }
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
-@@ -74,9 +74,9 @@ internal object PlayerPlaybackNetworking {
+@@ -80,9 +80,9 @@ internal object PlayerPlaybackNetworking {
       */
      internal val playbackHttpClient: OkHttpClient by lazy {
          val dispatcher = okhttp3.Dispatcher().apply {
@@ -801,7 +801,7 @@ index 7a832dc4..35445806 100644
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
-index 7230fb04..7d97b2e2 100644
+index 7230fb04f..7d97b2e2f 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 @@ -38,6 +38,10 @@ object MemoryBudget {
@@ -873,7 +873,7 @@ index 7230fb04..7d97b2e2 100644
      fun maxChunkMb(bufferMb: Int, connectionCount: Int): Int =
          ((budgetMb - bufferMb) / bufferCount(connectionCount)).coerceIn(MIN_CHUNK_MB, tierMaxChunkMb)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
-index 6395de08..46b717a8 100644
+index 6395de088..46b717a8b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackBufferNetworkSettings.kt
 @@ -362,7 +362,23 @@ private fun ParallelNetworkControls(
@@ -902,10 +902,10 @@ index 6395de08..46b717a8 100644
                  MemoryBudget.MAX_CONNECTIONS
              },
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index c67b021b..d466e2a4 100644
+index 7f9271b96..c9b66d5fc 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -3367,7 +3367,7 @@
+@@ -3376,7 +3376,7 @@
      <string name="playback_net_parallel">Parallel Connections</string>
      <string name="playback_net_parallel_sub">Use multiple connections in parallel for fetching streams. Activate when you experience buffering although your download speed is definitely more than sufficient.</string>
      <string name="playback_net_connection_count">Connection Count</string>
@@ -918,7 +918,7 @@ index c67b021b..d466e2a4 100644
 2.47.3
 
 
-From 821b62918d1f9b2bbd35d9d4d82aa66ac6238651 Mon Sep 17 00:00:00 2001
+From bd47c7c2239b8e7a2dff00157c88a995628668fb Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:14 +0000
 Subject: [PATCH 3/6] Parallel engine: hard concurrency gate, fast start,
@@ -954,7 +954,7 @@ headroom + escalations; threads spawn lazily, smaller configs unaffected).
  1 file changed, 92 insertions(+), 8 deletions(-)
 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index 09d13935..1587b4a2 100644
+index 09d139359..1587b4a25 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 @@ -75,10 +75,13 @@ internal class ParallelRangeDataSource(
@@ -1145,7 +1145,7 @@ index 09d13935..1587b4a2 100644
 2.47.3
 
 
-From 611305ceb5f711dc6595df3522d3baea9e2e5dc4 Mon Sep 17 00:00:00 2001
+From 62c6ec9627b7460aee02fa14e9c6d7a1fb8b5195 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:18 +0000
 Subject: [PATCH 4/6] Ledger tests for the 256 tier + dev-256 CI workflow
@@ -1171,7 +1171,7 @@ The release workflow stays untouched.
 
 diff --git a/.github/workflows/dev-256-build.yml b/.github/workflows/dev-256-build.yml
 new file mode 100644
-index 00000000..1e3ca038
+index 000000000..1e3ca038b
 --- /dev/null
 +++ b/.github/workflows/dev-256-build.yml
 @@ -0,0 +1,88 @@
@@ -1265,7 +1265,7 @@ index 00000000..1e3ca038
 +          retention-days: 14
 diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
 new file mode 100644
-index 00000000..c42e5566
+index 000000000..c42e5566f
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
 @@ -0,0 +1,159 @@
@@ -1432,7 +1432,7 @@ index 00000000..c42e5566
 2.47.3
 
 
-From 33fd6ce1d835f0e5fd75cc5a468ea6044ca6684a Mon Sep 17 00:00:00 2001
+From 32530f2b80193f034ab39c9dbc932dcd6057c0a2 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:28 +0000
 Subject: [PATCH 5/6] Parallel engine: gate-based AIMD, bounded cancel drain,
@@ -1477,7 +1477,7 @@ scope per the no-disk-writeback constraint.
  2 files changed, 218 insertions(+), 20 deletions(-)
 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index 1587b4a2..5b5c950b 100644
+index 1587b4a25..5b5c950b5 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 @@ -51,6 +51,11 @@ internal class ParallelRangeDataSource(
@@ -1834,7 +1834,7 @@ index 1587b4a2..5b5c950b 100644
          session = pending
          try {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
-index 7d97b2e2..5db5d1a9 100644
+index 7d97b2e2f..5db5d1a98 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
 @@ -263,6 +263,55 @@ object MemoryBudget {
@@ -1897,7 +1897,7 @@ index 7d97b2e2..5db5d1a9 100644
 2.47.3
 
 
-From 4de70b2c7fb00ac68819bdfe46b21404b0f4edbc Mon Sep 17 00:00:00 2001
+From 7dfcfc266581fcb71f29ab85c4310f28fe280086 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:33 +0000
 Subject: [PATCH 6/6] Wire playback clients to the shared connection pool +
@@ -1926,10 +1926,10 @@ against the real production MemoryBudget source.
  2 files changed, 88 insertions(+)
 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-index 35445806..ac43c40a 100644
+index 2c7f24309..4aa669085 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
-@@ -52,6 +52,7 @@ internal object PlayerPlaybackNetworking {
+@@ -58,6 +58,7 @@ internal object PlayerPlaybackNetworking {
          }
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
@@ -1937,7 +1937,7 @@ index 35445806..ac43c40a 100644
              .dns(IPv4FirstDns())
              .socketFactory(PlaybackSocketFactory)
              .eventListenerFactory(PlaybackConnectionEvents)
-@@ -80,6 +81,12 @@ internal object PlayerPlaybackNetworking {
+@@ -86,6 +87,12 @@ internal object PlayerPlaybackNetworking {
          }
          OkHttpClient.Builder()
              .dispatcher(dispatcher)
@@ -1951,7 +1951,7 @@ index 35445806..ac43c40a 100644
              .socketFactory(PlaybackSocketFactory)
              .eventListenerFactory(PlaybackConnectionEvents)
 diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
-index c42e5566..6ce66de5 100644
+index c42e5566f..6ce66de55 100644
 --- a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
 +++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
 @@ -5,6 +5,7 @@ package com.nuvio.tv.ui.screens.settings

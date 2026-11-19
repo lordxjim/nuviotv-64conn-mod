@@ -4,11 +4,11 @@ name: Patch & Build (256-conn dev)
 # verifies the patch invariants, builds the APK, and unit-tests the patched
 # app AGAINST an unpatched baseline run of the same suite.
 #
-# The patch is authored against pristine upstream dev @ 48d6449 (same model as
-# the 64-conn patch): commit 1 is the original 64-connection mod, commits 2-6
-# are the 256 tier. One `git am` applies everything; no patch chaining and no
-# dependency on the main branch's nuviotv-64conn.patch (this patch supersedes
-# it).
+# The patch is authored against pristine upstream dev @ 5b38442d (2026-11-19
+# tip; same model as the 64-conn patch): commit 1 is the original
+# 64-connection mod, commits 2-6 are the 256 tier. One `git am` applies
+# everything; no patch chaining and no dependency on the main branch's
+# nuviotv-64conn.patch (this patch supersedes it).
 #
 # Job map:
 #   patch-verify-build   apply + verify + assembleFullDebug -> APK artifact
@@ -21,7 +21,14 @@ name: Patch & Build (256-conn dev)
 # (upstream's own CI only runs com.nuvio.tv.updater.* for the same reason).
 #
 # Tested baseline (patch applies cleanly with git am --3way):
-#   - dev  @ 48d6449  (default branch tip, the patch's authored base)
+#   - dev  @ 5b38442d  (default branch tip 2026-11-19, the patch's authored base)
+#
+# History: originally authored against 48d6449; rebased onto 5b38442d on
+# 2026-11-19 after a 6677-commit upstream wave (sole conflict: the
+# PerformanceHelper pool-constant region — kept upstream's back-buffer rework
+# and our pool sizing). If upstream moves again and `git am --3way` conflicts,
+# dispatch with upstream_ref=5b38442d to build the tested base while waiting
+# for a rebase.
 
 on:
   workflow_dispatch:
@@ -75,7 +82,10 @@ jobs:
           git config user.name "patch-ci"
           git config user.email "patch-ci@users.noreply.github.com"
           echo "UPSTREAM_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          git am --3way mod/nuviotv-256conn.patch
+          if ! git am --3way mod/nuviotv-256conn.patch; then
+            echo "::error::nuviotv-256conn.patch does not apply to $(git rev-parse --short HEAD): upstream moved past the patch's authored base (5b38442d, 2026-11-19). Quick unblock: re-run this workflow with upstream_ref=5b38442d7 to build the tested base. For newer refs the patch needs a rebase (see README, section 上游升级后)."
+            exit 1
+          fi
           echo "Patched HEAD: $(git log --oneline -1)"
 
       - name: Verify patch invariants
@@ -168,7 +178,10 @@ jobs:
         run: |
           git config user.name "patch-ci"
           git config user.email "patch-ci@users.noreply.github.com"
-          git am --3way mod/nuviotv-256conn.patch
+          if ! git am --3way mod/nuviotv-256conn.patch; then
+            echo "::error::nuviotv-256conn.patch does not apply to $(git rev-parse --short HEAD): upstream moved past the patch's authored base (5b38442d, 2026-11-19). Quick unblock: re-run this workflow with upstream_ref=5b38442d7 to build the tested base."
+            exit 1
+          fi
 
       - name: Verify patch invariants
         run: bash mod/verify-patch.sh

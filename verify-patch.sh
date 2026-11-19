@@ -171,6 +171,47 @@ present "warm session TTL 45s intact" \
   'RETAINED_SESSION_TTL_MS = 45_000L' "$PD"
 present "eviction touch guard intact" \
   'EVICTION_TOUCH_GUARD_MS' "$PD"
+echo "== Domain 5b: four-point network recovery (park loop + epoch + pacer + refill) =="
+present "park loop wraps the retry ladder (unlimited connection-level retries)" \
+  'private fun downloadChunkLadder' "$PD"
+present "park delay first round fixed 1s" \
+  'NETWORK_PARK_FIRST_MS = 1_000L' "$PD"
+present "park delay steady fixed 2s" \
+  'NETWORK_PARK_STEADY_MS = 2_000L' "$PD"
+present "park delay hard cap 5s (plan ceiling)" \
+  'NETWORK_PARK_HARD_CAP_MS = 5_000L' "$PD"
+present "429 park rides the gate-recovery cadence (5s)" \
+  'RATE_LIMIT_PARK_MS = 5_000L' "$PD"
+present "parked sleep sliced for epoch wake (200ms)" \
+  'NETWORK_PARK_SLICE_MS = 200L' "$PD"
+present "parkable-failure classifier declared" \
+  'private fun isParkableFailure' "$PD"
+present "parked sleep is cancellable + epoch-woken" \
+  'private fun parkInterruptibly' "$PD"
+present "session recovery epoch declared (first-success global reset)" \
+  'networkRecoveryEpoch = AtomicInteger\(0\)' "$PD"
+present "first success broadcasts recovery to parked workers" \
+  'fun noteNetworkRecovered' "$PD"
+present "NET_PARK field log tag present" \
+  'NET_PARK chunk=' "$PD"
+present "NET_RECOVER field log tag present" \
+  'NET_RECOVER first success' "$PD"
+present "NET_WAKE field log tag present" \
+  'NET_WAKE chunk' "$PD"
+present "connect pacer bounds handshakes at 32 (burst 16-32 plan)" \
+  'CONNECT_PACER_PERMITS = 32' "$PD"
+present "pacer is a fair FIFO semaphore" \
+  'connectPacer = Semaphore\(CONNECT_PACER_PERMITS, true\)' "$PD"
+present "chunk opens gated by the pacer" \
+  'connectPacer\.acquire\(\)' "$PD"
+present "reader escalation bypasses the pacer (single urgent conn)" \
+  'paced = false' "$PD"
+present "first success marks network recovered at the open site" \
+  'activeSession\.noteNetworkRecovered\(\)' "$PD"
+present "event-driven refill fires on chunk completion" \
+  'refill the window.s leading' "$PD"
+present "worker-visible reader fields published volatile" \
+  '@Volatile private var position: Long = 0' "$PD"
 
 echo "== Domain 6: User-Agent strategy =="
 present "playback UA is honest player identity" \

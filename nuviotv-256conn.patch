@@ -1,4 +1,4 @@
-From 7548b9eacd213f6f73d838b9a299cf790841401d Mon Sep 17 00:00:00 2001
+From 5bfbfabe193f57a13843d30f44aba72e20b7715a Mon Sep 17 00:00:00 2001
 From: sim <sim@example.com>
 Date: Tue, 17 Nov 2026 15:05:03 +0000
 Subject: [PATCH 1/7] Raise parallel connection cap to 64 (native tier) with
@@ -596,7 +596,7 @@ index 000000000..d583163bc
 2.47.3
 
 
-From b9ad1f46a66b3f31ecd79004ac420efe6c41763e Mon Sep 17 00:00:00 2001
+From 351284fc44afb392cae3239c16b155d53d64fd5e Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:08 +0000
 Subject: [PATCH 2/7] Raise parallel connection cap to 256 with byte-accurate
@@ -918,7 +918,7 @@ index 7f9271b96..c9b66d5fc 100644
 2.47.3
 
 
-From 68e9170fdaf9231d541cc836e4473acb88bf636c Mon Sep 17 00:00:00 2001
+From 01f9fe9a96b11feba799c0645f3348ff7d43929e Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:14 +0000
 Subject: [PATCH 3/7] Parallel engine: hard concurrency gate, fast start,
@@ -1145,7 +1145,7 @@ index 09d139359..1587b4a25 100644
 2.47.3
 
 
-From 9403378f45f6ce1c7b76ee3f3b15d294b63bcb60 Mon Sep 17 00:00:00 2001
+From 1e02e41d6354a71a8875bc1d08914cb01aa122f3 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:18 +0000
 Subject: [PATCH 4/7] Ledger tests for the 256 tier + dev-256 CI workflow
@@ -1432,7 +1432,7 @@ index 000000000..c42e5566f
 2.47.3
 
 
-From 0496d77a3cdbaa32da1bd4bc517fd929650648fa Mon Sep 17 00:00:00 2001
+From 8ba433dc8c257f6eaff6824bdbea8dc63eb39be5 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:28 +0000
 Subject: [PATCH 5/7] Parallel engine: gate-based AIMD, bounded cancel drain,
@@ -1899,7 +1899,7 @@ index 7d97b2e2f..5db5d1a98 100644
 2.47.3
 
 
-From f0f4039c7781ef410414fb89e83dd6a74c56f5cb Mon Sep 17 00:00:00 2001
+From 53e92f60f06a413a0dccfad5082bc9970e2ad291 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:33 +0000
 Subject: [PATCH 6/7] Wire playback clients to the shared connection pool +
@@ -2053,41 +2053,79 @@ index c42e5566f..6ce66de55 100644
 2.47.3
 
 
-From 02988d3efd3ba86e8f075dd907fe1e8145109b9e Mon Sep 17 00:00:00 2001
+From 96e6cef1942c616d7aeb4c480fdf2b05592fafd6 Mon Sep 17 00:00:00 2001
 From: verify <verify@local>
 Date: Thu, 19 Nov 2026 17:23:11 +0000
 Subject: [PATCH 7/7] =?UTF-8?q?Parallel=20engine:=20aria2-parity=20recover?=
- =?UTF-8?q?y=20=E2=80=94=20multiplicative=20gate=20ramp,=20floor-watchdog?=
- =?UTF-8?q?=20liveness,=20brownout=20retry=20ladder?=
+ =?UTF-8?q?y=20=E2=80=94=20park=20loop,=20recovery=20epoch,=20handshake=20?=
+ =?UTF-8?q?pacer,=20event-driven=20refill?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-- MemoryBudget.aimdIncreaseGate: +1/16 per step -> double per step (min step
-  1/16), so a 429-latched gate recovers floor->full in ~4 steps instead of 15;
-  gate recovery now runs on a fixed 5s cadence (GATE_RECOVERY_STEP_MS),
-  decoupled from the depth stepper's doubling; depth step cap 60s -> 20s.
-- Stall-ladder endgame: the watchdog-disabled final read is gone — a ~0 B/s
-  socket could hold its gate permit forever. After the 3 adaptive restarts,
-  up to 3 floor-watchdog restarts (>= 16 KB/s over 2 windows or die) run,
-  then the chunk fails terminally (StallLadderExhaustedException) instead of
-  zombie-trickling. The reader escalation races under the same floor
-  watchdog instead of none.
-- Chunk retry: 4 fast attempts (50-80ms) plus a 4-attempt brownout tier
-  (250ms -> 1s + jitter) that rides out 10-30s carrier weather by
-  reconnecting (aria2 --max-tries/--retry-wait semantics) instead of
-  failing the chunk and tearing the session down.
+Field feedback: after a 10-30s carrier outage the window stayed at 2-3
+connections indefinitely. Root cause: the retry ladder only spans ~3s
+(4 fast 50-80ms + 4 brownout 250ms->1s); a longer outage exhausted it,
+the chunk future completed exceptionally and stayed in the session
+futures map — and ensureChunkScheduled keys on computeIfAbsent, so a
+dead future was never re-scheduled. The window never refilled.
+
+Four-point recovery plan (aria2 --retry-wait parity):
+
+1. Event-driven refill: a completed chunk immediately re-runs
+   scheduleChunks() from the worker thread, refilling the window's
+   leading edge without waiting for the next player read. Reader-owned
+   fields read across threads (position, bytesRemaining, session,
+   continuation pair, bytesServedThisOpen, totalFileLength) are now
+   @Volatile — 64-bit longs tear on 32-bit ARM.
+
+2. First-success global reset: a session-level recovery epoch. The
+   first chunk to succeed after a failure streak bumps the epoch; every
+   parked worker wakes within one 200ms park slice and re-enters its
+   fast retry tier together (NET_RECOVER/NET_WAKE log tags).
+
+3. Handshake pacer: a fair Semaphore(32) around ds.open(). A post-
+   outage refill of the 256-connection window becomes a 32-wide
+   rolling burst (~1-2s to re-establish) instead of a 256-SYN stampede
+   that server SYN-flood protection would read as an attack. The
+   reader escalation bypasses the pacer (single deduplicated urgent
+   connection, paced=false).
+
+4. Fixed short backoff, unlimited connection-level retries: when the
+   ladder exhausts on network weather (connection errors, 429/503
+   budget exhaustion, stall-ladder exhaustion), the chunk parks with
+   its gate permit held — like an aria2 worker holding its slot — and
+   retries after a fixed 1s (first round) -> 2s (steady) + jitter,
+   never above 5s. HTTP verdicts (403/404/...) and non-IO failures
+   still fail the chunk fast; the reader's 60s future budget remains
+   the task-level backstop. This also eliminates the zombie-future
+   class entirely: network-weather chunks never complete their future
+   exceptionally, so nothing dead is left in the map.
+
+Also in this commit (unchanged from the first cut): multiplicative
+gate recovery on a fixed 5s cadence (x2 per step, <=4 steps floor ->
+full), 16KB/s stall-floor watchdog over 2 consecutive windows (no more
+gate-permit-holding zombie reads), normal network errors and stalls
+never shrink the connection pool (only explicit 429/503 do).
 ---
- .../screens/player/ParallelRangeDataSource.kt | 152 ++++++++++++++----
+ .../screens/player/ParallelRangeDataSource.kt | 336 ++++++++++++++++--
  .../tv/ui/screens/settings/MemoryBudget.kt    |   7 +-
- .../settings/MemoryBudgetParallel256Test.kt   |  18 ++-
- 3 files changed, 138 insertions(+), 39 deletions(-)
+ .../settings/MemoryBudgetParallel256Test.kt   |  18 +-
+ 3 files changed, 314 insertions(+), 47 deletions(-)
 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index 258767940..2c9e8b6ab 100644
+index 258767940..cd2fcc054 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-@@ -71,6 +71,15 @@ internal class ParallelRangeDataSource(
+@@ -19,6 +19,7 @@ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.ThreadPoolExecutor
+ import java.util.concurrent.SynchronousQueue
+ import java.util.concurrent.ThreadFactory
++import java.util.concurrent.Semaphore
+ import java.util.concurrent.TimeUnit
+ import com.nuvio.tv.data.local.PlayerSettings
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -71,6 +72,15 @@ internal class ParallelRangeDataSource(
          private const val HEDGE_WINDOWS_CDN = 1
          private const val HEDGE_WINDOWS_USENET = 2
  
@@ -2103,7 +2141,18 @@ index 258767940..2c9e8b6ab 100644
          @VisibleForTesting
          internal var allocateChunk: (Int) -> Allocation? = { DefaultAllocatorNative.createAllocation(it) }
          @VisibleForTesting
-@@ -175,6 +184,14 @@ internal class ParallelRangeDataSource(
+@@ -109,6 +119,10 @@ internal class ParallelRangeDataSource(
+         private val activeInstances = java.util.concurrent.atomic.AtomicInteger(0)
+         private val globalBufferPool = ConcurrentHashMap<Long, ConcurrentLinkedDeque<PooledBuffer>>()
+ 
++        // Fair FIFO: during a post-outage refill every parked worker queues here in
++        // wake order, so handshakes start 32 at a time in the order the epoch woke them.
++        private val connectPacer = Semaphore(CONNECT_PACER_PERMITS, true)
++
+         // P4: bounded drain so a cancelled-almost-done response body still returns its
+         // socket to the pool (okhttp reuses only fully-read bodies). Best-effort and
+         // bounded by MemoryBudget.CANCEL_DRAIN_MAX_BYTES: larger remainders are closed,
+@@ -175,6 +189,42 @@ internal class ParallelRangeDataSource(
          private const val CHUNK_RETRY_BASE_DELAY_MS = 50L
          private const val CHUNK_RETRY_JITTER_MS = 30L
  
@@ -2115,10 +2164,38 @@ index 258767940..2c9e8b6ab 100644
 +        private val BROWNOUT_RETRY_DELAYS_MS = longArrayOf(250L, 500L, 1_000L, 1_000L)
 +        private const val BROWNOUT_RETRY_JITTER_MS = 100L
 +
++        // Four-point recovery plan (aria2 --retry-wait parity): the ladder above only
++        // spans ~3s of network weather. A longer outage used to exhaust it, complete
++        // the chunk future exceptionally and leave it in the session map — and because
++        // ensureChunkScheduled keys on computeIfAbsent, a dead future was NEVER
++        // re-scheduled. One 10-30s carrier outage left the window permanently at the
++        // reader's 2-3 connections. The park loop in downloadChunk fixes the class of
++        // bug: network-weather failures park the chunk (permit held, like an aria2
++        // worker holding its slot) and retry on a fixed short cadence, forever.
++        private const val NETWORK_PARK_FIRST_MS = 1_000L
++        private const val NETWORK_PARK_STEADY_MS = 2_000L
++        private const val NETWORK_PARK_JITTER_MS = 500L
++        // Plan cap: park delay never exceeds 5s, so the post-recovery burst starts
++        // within one park slice of the first successful reconnect.
++        private const val NETWORK_PARK_HARD_CAP_MS = 5_000L
++        // 429/503 exhaustion parks on the gate-recovery cadence: the AIMD ceiling is
++        // still climbing back (x2 per 5s), so retrying sooner only re-trips it.
++        private const val RATE_LIMIT_PARK_MS = 5_000L
++        // Parked workers poll the recovery epoch at this granularity; the first
++        // success after failures wakes all of them within one slice.
++        private const val NETWORK_PARK_SLICE_MS = 200L
++
++        // Mass-refill handshake bound (plan: 16-32 concurrent new connections per
++        // window). Steady state never approaches this many simultaneous opens; after
++        // an outage the 256 re-fillers queue here, so the server sees a 32-wide
++        // rolling burst (~1-2s to re-establish the full pool) instead of a 256-SYN
++        // stampede that its SYN-flood protection would read as an attack.
++        private const val CONNECT_PACER_PERMITS = 32
++
          private const val RATE_LIMIT_BACKOFF_CYCLE_CAP_MS = 3_000L
  
          private const val RATE_LIMIT_WAIT_HARD_CAP_MS = 15_000L
-@@ -182,7 +199,15 @@ internal class ParallelRangeDataSource(
+@@ -182,7 +232,15 @@ internal class ParallelRangeDataSource(
          private const val RATE_LIMIT_SLEEP_SLICE_MS = 100L
  
          private const val RATE_LIMIT_DEPTH_STEP_BASE_MS = 10_000L
@@ -2135,7 +2212,36 @@ index 258767940..2c9e8b6ab 100644
          private const val RATE_LIMIT_ESCALATION_MAX = 5
  
          @Volatile var hudClampLatched: Boolean = false
-@@ -416,15 +441,16 @@ internal class ParallelRangeDataSource(
+@@ -302,6 +360,28 @@ internal class ParallelRangeDataSource(
+             @Volatile var lastGateStepAtMs: Long = 0L
+             @Volatile var hudGateCeiling: Int = 0
+ 
++            // Network-recovery epoch (four-point plan): the first chunk to succeed
++            // after a failure streak bumps the epoch, and every parked worker wakes
++            // within one park slice — "network is back" is broadcast to the whole
++            // window at once instead of being rediscovered per worker over each
++            // one's own staggered backoff.
++            val networkRecoveryEpoch = AtomicInteger(0)
++            @Volatile var sawNetworkFailure = false
++            val parkedWorkers = AtomicInteger(0)
++
++            fun noteNetworkFailure() { sawNetworkFailure = true }
++
++            fun noteNetworkRecovered() {
++                if (sawNetworkFailure) {
++                    sawNetworkFailure = false
++                    val woken = parkedWorkers.get()
++                    networkRecoveryEpoch.incrementAndGet()
++                    if (woken > 0) {
++                        Log.i(TAG, "NET_RECOVER first success after failures; waking $woken parked chunk workers")
++                    }
++                }
++            }
++
+             val inFlight = ConcurrentHashMap<Long, InFlightChunk>()
+             @Volatile var lastUsedAtMs: Long = SystemClock.uptimeMillis()
+ 
+@@ -416,15 +496,16 @@ internal class ParallelRangeDataSource(
              }
  
              /**
@@ -2157,18 +2263,158 @@ index 258767940..2c9e8b6ab 100644
                      val stepped = connectionGate.recover()
                      lastGateStepAtMs = now
                      if (!connectionGate.isThrottled()) {
-@@ -1204,7 +1230,7 @@ internal class ParallelRangeDataSource(
+@@ -722,9 +803,12 @@ internal class ParallelRangeDataSource(
+ 
+     private var resolvedUri: Uri? = null
+     private var originalDataSpec: DataSpec? = null
+-    private var totalFileLength: Long = C.LENGTH_UNSET.toLong()
+-    private var position: Long = 0
+-    private var bytesRemaining: Long = C.LENGTH_UNSET.toLong()
++    // @Volatile: scheduleChunks() is also invoked from worker threads (event-driven
++    // refill on chunk completion), so these reader-thread-owned fields must publish
++    // safely — 64-bit longs tear on 32-bit ARM otherwise.
++    @Volatile private var totalFileLength: Long = C.LENGTH_UNSET.toLong()
++    @Volatile private var position: Long = 0
++    @Volatile private var bytesRemaining: Long = C.LENGTH_UNSET.toLong()
+     private val closed = AtomicBoolean(false)
+ 
+     private val effectivePrefetchDepth: Int =
+@@ -741,8 +825,8 @@ internal class ParallelRangeDataSource(
+     private var bootstrapPrefetchDeferred: Boolean = false
+     private var bootstrapChunk: DownloadedChunk? = null
+     private var bootstrapStartPosition: Long = C.TIME_UNSET
+-    private var continuationSource: OkHttpDataSource? = null
+-    private var continuationEndPositionExclusive: Long = C.TIME_UNSET
++    @Volatile private var continuationSource: OkHttpDataSource? = null
++    @Volatile private var continuationEndPositionExclusive: Long = C.TIME_UNSET
+ 
+     private var pendingContinuationOpen: Boolean = false
+ 
+@@ -750,9 +834,9 @@ internal class ParallelRangeDataSource(
+ 
+     private var fallbackSource: OkHttpDataSource? = null
+ 
+-    private var session: ChunkSession? = null
++    @Volatile private var session: ChunkSession? = null
+ 
+-    private var bytesServedThisOpen: Long = 0L
++    @Volatile private var bytesServedThisOpen: Long = 0L
+     private var inFlightServeLogged: Boolean = false
+ 
+     private val sessionChunkCap: Int = effectivePrefetchDepth +
+@@ -1204,7 +1288,7 @@ internal class ParallelRangeDataSource(
          sharedExecutor.execute {
              try {
                  if (typed.isDone || typed.isCancelled || activeSession.abandoned.get()) return@execute
 -                val result = downloadChunkOnce(activeSession, chunkIndex, typed, allowStallRestart = false)
-+                val result = downloadChunkOnce(activeSession, chunkIndex, typed, stallPolicy = StallWatchdog.FLOOR)
++                val result = downloadChunkOnce(activeSession, chunkIndex, typed, stallPolicy = StallWatchdog.FLOOR, paced = false)
                  if (typed.complete(result)) {
                      Log.w(TAG, "RS_ESCALATE won chunk=$chunkIndex ms=${SystemClock.elapsedRealtime() - t0}")
                  } else {
-@@ -1384,7 +1410,8 @@ internal class ParallelRangeDataSource(
+@@ -1360,6 +1444,12 @@ internal class ParallelRangeDataSource(
+                         val result = downloadChunk(activeSession, chunkIndex, future)
+                         if (!future.complete(result)) {
+                             releaseBuffer(result.buffer)
++                        } else {
++                            // Recovery plan, point 1: a completed chunk is the cheapest
++                            // proof the network is serving — refill the window's leading
++                            // edge NOW instead of waiting for the next player read,
++                            // which can be seconds away while the buffer is full.
++                            scheduleChunks()
+                         }
+                     } else if (future.isCancelled) {
+ 
+@@ -1383,8 +1473,96 @@ internal class ParallelRangeDataSource(
+     }
  
      private fun downloadChunk(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
++        // Four-point plan, point 4: connection-level retries are UNLIMITED on a fixed
++        // short cadence. The ladder below spans ~3s; when network weather outlasts it,
++        // the chunk parks (gate permit held, like an aria2 worker holding its slot)
++        // and re-enters the ladder after a fixed 1-2s park (capped at 5s). Only real
++        // verdicts — HTTP 4xx/5xx other than 429/503, non-IO failures — end the chunk;
++        // the reader's 60s future budget remains the task-level backstop.
++        var parkRound = 0
++        while (true) {
++            if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
++            try {
++                return downloadChunkLadder(activeSession, chunkIndex, future)
++            } catch (e: Exception) {
++                if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
++                if (!isParkableFailure(e)) {
++                    throw IOException("Failed to download chunk $chunkIndex after ${CHUNK_RETRY_BUDGET + BROWNOUT_RETRY_BUDGET} attempts", e)
++                }
++                activeSession.noteNetworkFailure()
++                val delayMs = parkDelayMs(e, parkRound)
++                val parked = activeSession.parkedWorkers.incrementAndGet()
++                Log.w(TAG, "NET_PARK chunk=$chunkIndex round=${parkRound + 1} delayMs=$delayMs " +
++                    "parked=$parked cause=${e.javaClass.simpleName}: ${e.message}")
++                val woke = parkInterruptibly(activeSession, future, delayMs)
++                activeSession.parkedWorkers.decrementAndGet()
++                if (!woke) throw IOException("Cancelled while parked")
++                parkRound++
++            }
++        }
++    }
++
++    /**
++     * Parkable = network weather, not a verdict: connection-level errors
++     * (reset/timeout/DNS), a 429/503 backoff-budget exhaustion, or a fully
++     * exhausted stall ladder. HTTP verdicts (403/404/…) and non-IO failures fail
++     * the chunk — parking those would just loop a permanent error against the
++     * reader's 60s budget. The ladder's terminal failure wraps its last exception,
++     * so the verdict status hides one cause down: unwrap before deciding.
++     */
++    private fun isParkableFailure(e: Exception): Boolean {
++        if (e is StallLadderExhaustedException) return true
++        if (e.findRateLimitException() != null) return true
++        var cause: Throwable? = e
++        var depth = 0
++        while (cause != null && depth < 6) {
++            if (cause is HttpDataSource.InvalidResponseCodeException) return false
++            cause = cause.cause
++            depth++
++        }
++        return e is IOException
++    }
++
++    /** Fixed short park: 1s on the first round, 2s after, jittered, never above 5s. */
++    private fun parkDelayMs(e: Exception, parkRound: Int): Long {
++        val base = when {
++            e is StallLadderExhaustedException -> NETWORK_PARK_STEADY_MS
++            e.findRateLimitException() != null -> RATE_LIMIT_PARK_MS
++            else -> if (parkRound == 0) NETWORK_PARK_FIRST_MS else NETWORK_PARK_STEADY_MS
++        }
++        return (base + (Math.random() * NETWORK_PARK_JITTER_MS).toLong())
++            .coerceAtMost(NETWORK_PARK_HARD_CAP_MS)
++    }
++
++    /**
++     * Parked sleep in slices: cancellable at any moment, and woken EARLY by a
++     * recovery-epoch bump (the first successful reconnect after failures) so the
++     * whole window re-enters its fast retry tier together.
++     */
++    private fun parkInterruptibly(activeSession: ChunkSession, future: CompletableFuture<*>, totalMs: Long): Boolean {
++        val epochAtPark = activeSession.networkRecoveryEpoch.get()
++        var slept = 0L
++        while (slept < totalMs) {
++            if (future.isCancelled || activeSession.abandoned.get()) return false
++            if (activeSession.networkRecoveryEpoch.get() != epochAtPark) {
++                Log.d(TAG, "NET_WAKE chunk park cut short by recovery epoch")
++                return true
++            }
++            val slice = minOf(NETWORK_PARK_SLICE_MS, totalMs - slept)
++            try {
++                Thread.sleep(slice)
++            } catch (_: InterruptedException) {
++                return false
++            }
++            slept += slice
++        }
++        return !(future.isCancelled || activeSession.abandoned.get())
++    }
++
++    private fun downloadChunkLadder(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
          var lastException: Exception? = null
 -        for (attempt in 0 until CHUNK_RETRY_BUDGET) {
 +        val totalBudget = CHUNK_RETRY_BUDGET + BROWNOUT_RETRY_BUDGET
@@ -2176,7 +2422,7 @@ index 258767940..2c9e8b6ab 100644
  
              if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
              try {
-@@ -1392,6 +1419,7 @@ internal class ParallelRangeDataSource(
+@@ -1392,6 +1570,7 @@ internal class ParallelRangeDataSource(
              } catch (e: Exception) {
  
                  if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
@@ -2184,7 +2430,7 @@ index 258767940..2c9e8b6ab 100644
                  lastException = e
  
                  if (e is StalledChunkException) {
-@@ -1401,25 +1429,38 @@ internal class ParallelRangeDataSource(
+@@ -1401,25 +1580,38 @@ internal class ParallelRangeDataSource(
                  if (rlError != null) {
                      return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError)
                  }
@@ -2224,20 +2470,41 @@ index 258767940..2c9e8b6ab 100644
      }
  
 -    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
-+    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, stallPolicy: StallWatchdog = StallWatchdog.ADAPTIVE): DownloadedChunk {
++    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, stallPolicy: StallWatchdog = StallWatchdog.ADAPTIVE, paced: Boolean = true): DownloadedChunk {
          val chunkStartMs = SystemClock.elapsedRealtime()
          val sessionLength = activeSession.totalLength
          val start = chunkIndex * chunkSize
-@@ -1445,7 +1486,7 @@ internal class ParallelRangeDataSource(
-             ds.open(spec)
+@@ -1442,10 +1634,27 @@ internal class ParallelRangeDataSource(
+ 
+             if (future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
+             Log.d(TAG, "Starting chunk download: idx=$chunkIndex, range=$start-$end")
+-            ds.open(spec)
++            // Recovery plan, point 3: bound concurrent handshakes to CONNECT_PACER_PERMITS
++            // so a post-outage refill of the window is a 32-wide rolling burst, not a
++            // 256-SYN stampede. The reader escalation passes paced=false: it is a single
++            // deduplicated urgent connection, exactly what the pacer is not for.
++            if (paced) {
++                connectPacer.acquire()
++                try {
++                    ds.open(spec)
++                } finally {
++                    connectPacer.release()
++                }
++            } else {
++                ds.open(spec)
++            }
  
              val expectedBytes = if (sessionLength > 0L) end - start else -1L
 -            val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, allowStallRestart)
 +            val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, stallPolicy)
++            // First success after any failure streak broadcasts "network is back":
++            // every parked worker wakes within one park slice and re-enters its fast
++            // retry tier together (recovery plan, point 2).
++            activeSession.noteNetworkRecovered()
              // Adaptive hedge bookkeeping: record this chunk's completion rate so the
              // stall threshold tracks what the line — including any carrier throttle —
              // actually delivers, instead of a fixed constant.
-@@ -1484,10 +1525,32 @@ internal class ParallelRangeDataSource(
+@@ -1484,10 +1693,32 @@ internal class ParallelRangeDataSource(
              }
          }
  
@@ -2273,7 +2540,7 @@ index 258767940..2c9e8b6ab 100644
      }
  
      private class StalledChunkException(
-@@ -1496,6 +1559,24 @@ internal class ParallelRangeDataSource(
+@@ -1496,6 +1727,24 @@ internal class ParallelRangeDataSource(
          val rateBps: Long
      ) : IOException("chunk $chunkIndex body stalled at ${rateBps}B/s (watermark=$watermark)")
  
@@ -2298,7 +2565,7 @@ index 258767940..2c9e8b6ab 100644
      private fun Exception.isTransientInterruption(): Boolean {
          if (this is InterruptedIOException || this is InterruptedException) return true
          val cause = cause
-@@ -1591,7 +1672,7 @@ internal class ParallelRangeDataSource(
+@@ -1591,7 +1840,7 @@ internal class ParallelRangeDataSource(
          ds: DataSource,
          future: CompletableFuture<*>,
          expectedBytes: Long,
@@ -2307,7 +2574,7 @@ index 258767940..2c9e8b6ab 100644
      ): DownloadedChunk {
          val buffer = acquireBuffer()
  
-@@ -1612,25 +1693,34 @@ internal class ParallelRangeDataSource(
+@@ -1612,25 +1861,34 @@ internal class ParallelRangeDataSource(
          var hedgeLastCheckBytes = 0
  
          val hedgeIsUsenet = activeSession.resolvedUri?.path?.contains("/usenet/") == true
@@ -2353,7 +2620,7 @@ index 258767940..2c9e8b6ab 100644
          var hedgeConsecutiveStalled = 0
          try {
              val byteBufferReader = if (useNativeMemory && ds is androidx.media3.common.ByteBufferDataReader && ds.supportsByteBufferRead()) {
-@@ -1691,9 +1781,9 @@ internal class ParallelRangeDataSource(
+@@ -1691,9 +1949,9 @@ internal class ParallelRangeDataSource(
                          "stalled=$hedgeStalled " +
                          "consec=$hedgeConsecutiveStalled/$hedgeWindowsRequired " +
                          "usenet=$hedgeIsUsenet clamp=$hudClampLatched " +

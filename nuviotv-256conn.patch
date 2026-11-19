@@ -1432,7 +1432,7 @@ index 000000000..c42e5566f
 2.47.3
 
 
-From 32530f2b80193f034ab39c9dbc932dcd6057c0a2 Mon Sep 17 00:00:00 2001
+From 13561685382312546fbd9d7765644364970d9d20 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:28 +0000
 Subject: [PATCH 5/6] Parallel engine: gate-based AIMD, bounded cancel drain,
@@ -1472,12 +1472,12 @@ the equilibrium is stable without a pacing scheduler, and P4 keeps sockets
 warm across refill boundaries. The disk-cache variant is explicitly out of
 scope per the no-disk-writeback constraint.
 ---
- .../screens/player/ParallelRangeDataSource.kt | 189 ++++++++++++++++--
+ .../screens/player/ParallelRangeDataSource.kt | 191 ++++++++++++++++--
  .../tv/ui/screens/settings/MemoryBudget.kt    |  49 +++++
- 2 files changed, 218 insertions(+), 20 deletions(-)
+ 2 files changed, 220 insertions(+), 20 deletions(-)
 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
-index 1587b4a25..5b5c950b5 100644
+index 1587b4a25..258767940 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
 @@ -51,6 +51,11 @@ internal class ParallelRangeDataSource(
@@ -1492,16 +1492,18 @@ index 1587b4a25..5b5c950b5 100644
          private const val BOOTSTRAP_READ_BYTES = 256L * 1024L
  
          private const val IN_FLIGHT_WAIT_CAP_MS = 3_000L
-@@ -84,7 +89,7 @@ internal class ParallelRangeDataSource(
+@@ -84,7 +89,9 @@ internal class ParallelRangeDataSource(
          // deepest legal window, and threads spawn lazily on smaller configurations.
          private val sharedExecutor: ExecutorService by lazy {
              val threadFactory = ThreadFactory { runnable ->
 -                Thread(runnable, "parallel-ds-worker").apply {
-+                Thread(runnable, "parallel-ds-worker", WORKER_THREAD_STACK_BYTES).apply {
++                // Java has no (Runnable, String, long) ctor: the stack size only
++                // exists on the 4-arg form, with a null ThreadGroup.
++                Thread(null, runnable, "parallel-ds-worker", WORKER_THREAD_STACK_BYTES).apply {
                      priority = Thread.NORM_PRIORITY
                      isDaemon = true
                  }
-@@ -102,6 +107,28 @@ internal class ParallelRangeDataSource(
+@@ -102,6 +109,28 @@ internal class ParallelRangeDataSource(
          private val activeInstances = java.util.concurrent.atomic.AtomicInteger(0)
          private val globalBufferPool = ConcurrentHashMap<Long, ConcurrentLinkedDeque<PooledBuffer>>()
  
@@ -1530,7 +1532,7 @@ index 1587b4a25..5b5c950b5 100644
          private fun freeDirectBuffer(buffer: ByteBuffer) {
              if (!buffer.isDirect) return
              try {
-@@ -174,6 +201,73 @@ internal class ParallelRangeDataSource(
+@@ -174,6 +203,73 @@ internal class ParallelRangeDataSource(
              return (hudNextStepAtMs - nowUptimeMs).coerceAtLeast(0L)
          }
  
@@ -1604,7 +1606,7 @@ index 1587b4a25..5b5c950b5 100644
          private class ChunkSession(
              val requestUri: Uri,
  
-@@ -181,7 +275,8 @@ internal class ParallelRangeDataSource(
+@@ -181,7 +277,8 @@ internal class ParallelRangeDataSource(
              val chunkSize: Long,
              val chunkCap: Int,
  
@@ -1614,7 +1616,7 @@ index 1587b4a25..5b5c950b5 100644
          ) {
              @Volatile var resolvedUri: Uri? = null
              @Volatile var totalLength: Long = -1L
-@@ -199,6 +294,12 @@ internal class ParallelRangeDataSource(
+@@ -199,6 +296,12 @@ internal class ParallelRangeDataSource(
              val rateLimitEscalation = AtomicInteger(0)
              val activeSources: MutableSet<DataSource> = java.util.concurrent.ConcurrentHashMap.newKeySet()
  
@@ -1627,7 +1629,7 @@ index 1587b4a25..5b5c950b5 100644
              val inFlight = ConcurrentHashMap<Long, InFlightChunk>()
              @Volatile var lastUsedAtMs: Long = SystemClock.uptimeMillis()
  
-@@ -248,7 +349,12 @@ internal class ParallelRangeDataSource(
+@@ -248,7 +351,12 @@ internal class ParallelRangeDataSource(
                  if (now - lastDepthHalveAtMs >= 1_000L) {
                      val alreadyCapped = rateLimitDepthCap.get() < configuredDepth
                      val effective = rateLimitDepthCap.get().coerceAtMost(configuredDepth)
@@ -1641,7 +1643,7 @@ index 1587b4a25..5b5c950b5 100644
                      if (halved < effective) {
                          rateLimitDepthCap.set(halved)
                          lastDepthHalveAtMs = now
-@@ -266,6 +372,15 @@ internal class ParallelRangeDataSource(
+@@ -266,6 +374,15 @@ internal class ParallelRangeDataSource(
                              "$halved/$configuredDepth (probe interval ${depthStepIntervalMs}ms)")
                      }
                  }
@@ -1657,7 +1659,7 @@ index 1587b4a25..5b5c950b5 100644
                  return escalation
              }
  
-@@ -275,7 +390,9 @@ internal class ParallelRangeDataSource(
+@@ -275,7 +392,9 @@ internal class ParallelRangeDataSource(
                  val now = SystemClock.uptimeMillis()
                  if (now - lastRateLimitAtMs >= depthStepIntervalMs &&
                      now - lastDepthStepAtMs >= depthStepIntervalMs) {
@@ -1668,7 +1670,7 @@ index 1587b4a25..5b5c950b5 100644
                      if (rateLimitDepthCap.compareAndSet(cap, stepped)) {
                          lastDepthStepAtMs = now
                          rateLimitEscalation.updateAndGet { (it - 1).coerceAtLeast(0) }
-@@ -295,6 +412,28 @@ internal class ParallelRangeDataSource(
+@@ -295,6 +414,28 @@ internal class ParallelRangeDataSource(
                  }
                  return rateLimitDepthCap.get().coerceAtMost(configuredDepth)
              }
@@ -1697,7 +1699,7 @@ index 1587b4a25..5b5c950b5 100644
          }
  
          private val sessionLock = Any()
-@@ -361,7 +500,8 @@ internal class ParallelRangeDataSource(
+@@ -361,7 +502,8 @@ internal class ParallelRangeDataSource(
              chunkSz: Long,
              chunkCap: Int,
              poolCap: Int,
@@ -1707,7 +1709,7 @@ index 1587b4a25..5b5c950b5 100644
          ): ChunkSession {
              synchronized(sessionLock) {
                  val existing = currentChunkSession
-@@ -372,6 +512,8 @@ internal class ParallelRangeDataSource(
+@@ -372,6 +514,8 @@ internal class ParallelRangeDataSource(
                          existing.requestHeaders == requestHeaders
                      ) {
                          existing.lastUsedAtMs = SystemClock.uptimeMillis()
@@ -1716,7 +1718,7 @@ index 1587b4a25..5b5c950b5 100644
                          return existing
                      }
                      teardownSessionLocked(existing, poolCap)
-@@ -427,7 +569,7 @@ internal class ParallelRangeDataSource(
+@@ -427,7 +571,7 @@ internal class ParallelRangeDataSource(
                  hudNextStepAtMs = 0L
                  hudHedgeRestarts = 0
                  hudHedgeExhausted = false
@@ -1725,7 +1727,7 @@ index 1587b4a25..5b5c950b5 100644
                  currentChunkSession = created
                  return created
              }
-@@ -449,7 +591,8 @@ internal class ParallelRangeDataSource(
+@@ -449,7 +593,8 @@ internal class ParallelRangeDataSource(
              chunkSz: Long,
              chunkCap: Int,
              poolCap: Int,
@@ -1735,7 +1737,7 @@ index 1587b4a25..5b5c950b5 100644
          ): ChunkSession? {
              synchronized(sessionLock) {
                  val live = currentChunkSession
-@@ -467,7 +610,7 @@ internal class ParallelRangeDataSource(
+@@ -467,7 +612,7 @@ internal class ParallelRangeDataSource(
                      }
                      teardownSessionLocked(existingPending, poolCap)
                  }
@@ -1744,7 +1746,7 @@ index 1587b4a25..5b5c950b5 100644
                  pendingChunkSession = created
                  return created
              }
-@@ -587,13 +730,8 @@ internal class ParallelRangeDataSource(
+@@ -587,13 +732,8 @@ internal class ParallelRangeDataSource(
  
      private val maxPoolSize = effectivePrefetchDepth + 2
  
@@ -1760,7 +1762,7 @@ index 1587b4a25..5b5c950b5 100644
  
      private var currentChunk: DownloadedChunk? = null
      private var currentChunkIndex: Long = -1
-@@ -685,7 +823,7 @@ internal class ParallelRangeDataSource(
+@@ -685,7 +825,7 @@ internal class ParallelRangeDataSource(
          resetLocalReadState()
          bytesServedThisOpen = 0L
  
@@ -1769,7 +1771,7 @@ index 1587b4a25..5b5c950b5 100644
          session = attachedSession
          val warmLength = attachedSession.totalLength
          if (warmLength > 0L && dataSpec.position in 0 until warmLength) {
-@@ -1182,6 +1320,9 @@ internal class ParallelRangeDataSource(
+@@ -1182,6 +1322,9 @@ internal class ParallelRangeDataSource(
          val maxAhead = session?.currentAllowedDepth(effectivePrefetchDepth)?.coerceAtMost(earnedAhead)
              ?: earnedAhead
  
@@ -1779,7 +1781,7 @@ index 1587b4a25..5b5c950b5 100644
          for (i in 0 until maxAhead) {
              val ci = currentChunkIdx + i
              if (totalFileLength != C.LENGTH_UNSET.toLong() && ci * chunkSize >= totalFileLength) break
-@@ -1206,7 +1347,7 @@ internal class ParallelRangeDataSource(
+@@ -1206,7 +1349,7 @@ internal class ParallelRangeDataSource(
                      return@execute
                  }
                  try {
@@ -1788,7 +1790,7 @@ index 1587b4a25..5b5c950b5 100644
                  } catch (e: InterruptedException) {
                      future.completeExceptionally(e)
                      Thread.currentThread().interrupt()
-@@ -1232,7 +1373,7 @@ internal class ParallelRangeDataSource(
+@@ -1232,7 +1375,7 @@ internal class ParallelRangeDataSource(
                          IOException("Native chunk buffer allocation failed (out of memory)", e)
                      )
                  } finally {
@@ -1797,7 +1799,7 @@ index 1587b4a25..5b5c950b5 100644
                  }
              }
              future
-@@ -1498,6 +1639,8 @@ internal class ParallelRangeDataSource(
+@@ -1498,6 +1641,8 @@ internal class ParallelRangeDataSource(
  
              while (!activeSession.abandoned.get()) {
                  if (future.isCancelled) {
@@ -1806,7 +1808,7 @@ index 1587b4a25..5b5c950b5 100644
                      throw IOException("Chunk download cancelled")
                  }
                  val maxRead = minOf(buffer.byteBuffer.capacity() - totalRead, READ_BUFFER_SIZE)
-@@ -1562,10 +1705,16 @@ internal class ParallelRangeDataSource(
+@@ -1562,10 +1707,16 @@ internal class ParallelRangeDataSource(
              }
          } catch (e: Exception) {
              releaseInFlightBuffer(activeSession, chunkIndex, inFlight, buffer)
@@ -1824,7 +1826,7 @@ index 1587b4a25..5b5c950b5 100644
              releaseInFlightBuffer(activeSession, chunkIndex, inFlight, buffer)
              throw IOException("Session abandoned")
          }
-@@ -1809,7 +1958,7 @@ internal class ParallelRangeDataSource(
+@@ -1809,7 +1960,7 @@ internal class ParallelRangeDataSource(
  
      internal fun prestartChunk0(uri: Uri) {
          val pending = obtainPendingSession(
@@ -1897,7 +1899,7 @@ index 7d97b2e2f..5db5d1a98 100644
 2.47.3
 
 
-From 7dfcfc266581fcb71f29ab85c4310f28fe280086 Mon Sep 17 00:00:00 2001
+From 86be012ace8d395447f64b77425adf9b3b865a85 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:33 +0000
 Subject: [PATCH 6/6] Wire playback clients to the shared connection pool +

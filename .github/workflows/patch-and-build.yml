@@ -124,7 +124,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build fullDebug APK
-        run: ./gradlew :app:assembleFullDebug --stacktrace
+        run: ./gradlew :app:assembleFullDebug --stacktrace -Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=750
 
       # Stamp the APK and artifact names with the OFFICIAL versionName from
       # app/build.gradle.kts (identical to what an official build of the same
@@ -218,12 +218,20 @@ jobs:
             echo "NUVIO_RELEASE_STORE_PASSWORD=android"
           } >> "$GITHUB_ENV"
 
+      # Hard step on purpose: if the patched tree breaks TEST compilation the
+      # job goes red HERE with the Kotlin error inline, instead of surfacing
+      # downstream as an opaque "0 xml" verdict.
+      - name: Compile test sources (patched)
+        run: ./gradlew :app:compileFullDebugUnitTestKotlin --console=plain
+
       # Tolerant on purpose: the verdict job decides red/green by comparing
       # against the baseline, so upstream's own failing tests do not mark the
-      # patch red by themselves.
+      # patch red by themselves. The retry props ride out Maven Central 429
+      # episodes: without them a dependency download failure kills this step
+      # and the verdict sees "0 xml", indistinguishable from a compile break.
       - name: Run full unit test suite
         continue-on-error: true
-        run: ./gradlew :app:testFullDebugUnitTest --stacktrace
+        run: ./gradlew :app:testFullDebugUnitTest --stacktrace -Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=750
 
       - name: Upload test results (XML)
         if: always()
@@ -285,11 +293,16 @@ jobs:
             echo "NUVIO_RELEASE_STORE_PASSWORD=android"
           } >> "$GITHUB_ENV"
 
+      # Hard step: a baseline compile break is upstream's, not ours — failing
+      # here (instead of "0 xml") makes that obvious at a glance.
+      - name: Compile test sources (baseline)
+        run: ./gradlew :app:compileFullDebugUnitTestKotlin --console=plain
+
       # Same tolerance as the patched job: pre-existing upstream failures are
-      # compared, not fatal.
+      # compared, not fatal. Retry props ride out Maven Central 429 episodes.
       - name: Run full unit test suite (baseline)
         continue-on-error: true
-        run: ./gradlew :app:testFullDebugUnitTest --stacktrace
+        run: ./gradlew :app:testFullDebugUnitTest --stacktrace -Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=750
 
       - name: Upload test results (XML)
         if: always()

@@ -44,7 +44,10 @@ def main():
     print(f"baseline: {len(b_files)} xml, {len(b_total)} tests, {len(b_fail)} failed")
 
     if not p_files:
-        print("\nVERDICT: FAIL — no patched test results (patched compile or apply step broke)")
+        print("\nVERDICT: FAIL — no patched test results. Open the 'Unit tests (patched)' job and check which step is red:")
+        print("  - red 'Apply 256-connection patch'      → upstream moved past the patch's authored base (re-run with upstream_ref=5b38442d7)")
+        print("  - red 'Compile test sources (patched)'  → the patch breaks test compilation; the Kotlin error is in that step's log")
+        print("  - job green but 0 xml                   → gradle could not download dependencies (e.g. Maven Central 429); see the test step log")
         return 1
     if not b_files:
         print("\nVERDICT: FAIL — no baseline test results (baseline build broke; inspect job log)")

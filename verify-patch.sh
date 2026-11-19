@@ -120,7 +120,7 @@ echo "== Domain 4: capacity, worker stack, shared connection pool =="
 present "worker thread stack trimmed to 512 KB" \
   'WORKER_THREAD_STACK_BYTES = 512L \* 1024L' "$PD"
 present "worker threads created with named stack size" \
-  'Thread\(runnable, "parallel-ds-worker", WORKER_THREAD_STACK_BYTES\)' "$PD"
+  'Thread\(null, runnable, "parallel-ds-worker", WORKER_THREAD_STACK_BYTES\)' "$PD"
 present "shared executor 272 core / 328 max" \
   '272, 328, 60L, TimeUnit\.SECONDS' "$PD"
 present "shared connection pool idle cap 512" \

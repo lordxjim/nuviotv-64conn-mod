@@ -145,7 +145,7 @@ jobs:
             echo "## Patched APK version stamp (256-conn dev)"
             echo "- Official versionName: **${VERSION_NAME}**"
             echo "- Pristine upstream base: ${UPSTREAM_SHA} (ref: ${{ inputs.upstream_ref || 'dev' }})"
-            echo "- Patch: nuviotv-256conn.patch (6 commits: 64-conn mod + 256 tier)"
+            echo "- Patch: nuviotv-256conn.patch (7 commits: 64-conn mod + 256 tier + aria2-parity recovery)"
             echo "- Artifact: \`${APK_BASE}-full-debug-apk\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

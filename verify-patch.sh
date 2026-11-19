@@ -65,6 +65,8 @@ present "AIMD decrease halves but never dies (floored)" \
   'coerceAtLeast\(aimdGateFloor\(connections\)\)' "$MB"
 present "AIMD increase gate declared" \
   'fun aimdIncreaseGate' "$MB"
+present "AIMD increase doubles per quiet step (multiplicative recovery)" \
+  'ceiling \+ maxOf\(ceiling, connections / 16\)' "$MB"
 present "AIMD floor helper declared" \
   'fun aimdGateFloor' "$MB"
 present "hedge stall floor 16 KB/s declared" \
@@ -101,6 +103,10 @@ present "quiet recovery raises the gate ceiling via AIMD increase" \
   'MemoryBudget\.aimdIncreaseGate\(' "$PD"
 present "recoverGateIfQuiet entry point present" \
   'fun recoverGateIfQuiet\(\)' "$PD"
+present "gate recovery on fixed 5s cadence (decoupled from depth doubling)" \
+  'GATE_RECOVERY_STEP_MS = 5_000L' "$PD"
+present "depth step cap tightened to 20s" \
+  'RATE_LIMIT_DEPTH_STEP_MAX_MS = 20_000L' "$PD"
 present "runtime cap raise via expandMax declared" \
   'fun expandMax\(connections: Int\)' "$PD"
 present "settings changes expand the live gate" \
@@ -132,13 +138,27 @@ present "playback clients route through shared pool optimizations" \
 n=$(grep -c 'maxRequests = 512' "$PN" 2>/dev/null || echo 0)
 if [ "$n" -eq 2 ]; then ok "both playback dispatchers at 512 ($n/2)"; else bad "both playback dispatchers at 512 (found $n/2)" "$PN"; fi
 
-echo "== Domain 5: chunk retry budget + 429 fuse (carried from the 64 mod) =="
+echo "== Domain 5: chunk retry budget + brownout ladder + 429 fuse =="
 present "chunk retry budget 4 attempts" \
   'CHUNK_RETRY_BUDGET = 4' "$PD"
 present "retry jitter constant present" \
   'CHUNK_RETRY_JITTER_MS = 30L' "$PD"
-present "retry loop uses the budget constant" \
-  'for \(attempt in 0 until CHUNK_RETRY_BUDGET\)' "$PD"
+present "retry loop spans fast + brownout tiers" \
+  'for \(attempt in 0 until totalBudget\)' "$PD"
+present "brownout ladder budget 4 attempts" \
+  'BROWNOUT_RETRY_BUDGET = 4' "$PD"
+present "brownout delays 250ms -> 1s tiered" \
+  'BROWNOUT_RETRY_DELAYS_MS = longArrayOf\(250L, 500L, 1_000L, 1_000L\)' "$PD"
+present "stall endgame restarts at floor threshold (3)" \
+  'STALL_ENDGAME_RESTARTS = 3' "$PD"
+present "floor watchdog needs 2 consecutive windows" \
+  'HEDGE_FLOOR_WINDOWS = 2' "$PD"
+present "floor watchdog policy enum declared" \
+  'enum class StallWatchdog' "$PD"
+absent "watchdog-disabled reads eliminated (aria2 liveness)" \
+  'allowStallRestart = false' "$PD"
+present "escalation races under the floor watchdog" \
+  'stallPolicy = StallWatchdog\.FLOOR' "$PD"
 present "rate-limit backoff budget untouched (3 rounds)" \
   'RATE_LIMIT_MAX_BACKOFF_RETRIES = 3' "$PD"
 present "429 fuse: depth halving entry point intact" \

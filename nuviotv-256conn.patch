@@ -1,7 +1,7 @@
-From c4eaafa73ddc26308d95c54781907772a12fd994 Mon Sep 17 00:00:00 2001
+From 7548b9eacd213f6f73d838b9a299cf790841401d Mon Sep 17 00:00:00 2001
 From: sim <sim@example.com>
 Date: Tue, 17 Nov 2026 15:05:03 +0000
-Subject: [PATCH 1/6] Raise parallel connection cap to 64 (native tier) with
+Subject: [PATCH 1/7] Raise parallel connection cap to 64 (native tier) with
  capacity & memory guards
 
 Config chain: MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY=64 as single
@@ -596,10 +596,10 @@ index 000000000..d583163bc
 2.47.3
 
 
-From 82a2c3772b9e47466580638aa0251cb52765db20 Mon Sep 17 00:00:00 2001
+From b9ad1f46a66b3f31ecd79004ac420efe6c41763e Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:08 +0000
-Subject: [PATCH 2/6] Raise parallel connection cap to 256 with byte-accurate
+Subject: [PATCH 2/7] Raise parallel connection cap to 256 with byte-accurate
  window budget
 
 Config chain: MAX_PARALLEL_CONNECTION_COUNT_NATIVE_MEMORY=256 remains the
@@ -918,10 +918,10 @@ index 7f9271b96..c9b66d5fc 100644
 2.47.3
 
 
-From bd47c7c2239b8e7a2dff00157c88a995628668fb Mon Sep 17 00:00:00 2001
+From 68e9170fdaf9231d541cc836e4473acb88bf636c Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:14 +0000
-Subject: [PATCH 3/6] Parallel engine: hard concurrency gate, fast start,
+Subject: [PATCH 3/7] Parallel engine: hard concurrency gate, fast start,
  adaptive hedge threshold
 
 Connection gate (P1): every window chunk download now acquires a fair
@@ -1145,10 +1145,10 @@ index 09d139359..1587b4a25 100644
 2.47.3
 
 
-From 62c6ec9627b7460aee02fa14e9c6d7a1fb8b5195 Mon Sep 17 00:00:00 2001
+From 9403378f45f6ce1c7b76ee3f3b15d294b63bcb60 Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Wed, 18 Nov 2026 19:25:18 +0000
-Subject: [PATCH 4/6] Ledger tests for the 256 tier + dev-256 CI workflow
+Subject: [PATCH 4/7] Ledger tests for the 256 tier + dev-256 CI workflow
 
 MemoryBudgetParallel256Test: 14 ledger tests over the real production
 source - byte-accurate depth (256x1MB on the 2GB tier -> 175 chunks, never
@@ -1432,10 +1432,10 @@ index 000000000..c42e5566f
 2.47.3
 
 
-From 13561685382312546fbd9d7765644364970d9d20 Mon Sep 17 00:00:00 2001
+From 0496d77a3cdbaa32da1bd4bc517fd929650648fa Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:28 +0000
-Subject: [PATCH 5/6] Parallel engine: gate-based AIMD, bounded cancel drain,
+Subject: [PATCH 5/7] Parallel engine: gate-based AIMD, bounded cancel drain,
  worker stack trim
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1899,10 +1899,10 @@ index 7d97b2e2f..5db5d1a98 100644
 2.47.3
 
 
-From 86be012ace8d395447f64b77425adf9b3b865a85 Mon Sep 17 00:00:00 2001
+From f0f4039c7781ef410414fb89e83dd6a74c56f5cb Mon Sep 17 00:00:00 2001
 From: sim <sim@local>
 Date: Thu, 19 Nov 2026 04:58:33 +0000
-Subject: [PATCH 6/6] Wire playback clients to the shared connection pool +
+Subject: [PATCH 6/7] Wire playback clients to the shared connection pool +
  AIMD/drain ledger tests
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2049,6 +2049,380 @@ index c42e5566f..6ce66de55 100644
 +        assertEquals(64L * kb, MemoryBudget.CANCEL_DRAIN_MAX_BYTES)
 +    }
  }
+-- 
+2.47.3
+
+
+From 02988d3efd3ba86e8f075dd907fe1e8145109b9e Mon Sep 17 00:00:00 2001
+From: verify <verify@local>
+Date: Thu, 19 Nov 2026 17:23:11 +0000
+Subject: [PATCH 7/7] =?UTF-8?q?Parallel=20engine:=20aria2-parity=20recover?=
+ =?UTF-8?q?y=20=E2=80=94=20multiplicative=20gate=20ramp,=20floor-watchdog?=
+ =?UTF-8?q?=20liveness,=20brownout=20retry=20ladder?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- MemoryBudget.aimdIncreaseGate: +1/16 per step -> double per step (min step
+  1/16), so a 429-latched gate recovers floor->full in ~4 steps instead of 15;
+  gate recovery now runs on a fixed 5s cadence (GATE_RECOVERY_STEP_MS),
+  decoupled from the depth stepper's doubling; depth step cap 60s -> 20s.
+- Stall-ladder endgame: the watchdog-disabled final read is gone — a ~0 B/s
+  socket could hold its gate permit forever. After the 3 adaptive restarts,
+  up to 3 floor-watchdog restarts (>= 16 KB/s over 2 windows or die) run,
+  then the chunk fails terminally (StallLadderExhaustedException) instead of
+  zombie-trickling. The reader escalation races under the same floor
+  watchdog instead of none.
+- Chunk retry: 4 fast attempts (50-80ms) plus a 4-attempt brownout tier
+  (250ms -> 1s + jitter) that rides out 10-30s carrier weather by
+  reconnecting (aria2 --max-tries/--retry-wait semantics) instead of
+  failing the chunk and tearing the session down.
+---
+ .../screens/player/ParallelRangeDataSource.kt | 152 ++++++++++++++----
+ .../tv/ui/screens/settings/MemoryBudget.kt    |   7 +-
+ .../settings/MemoryBudgetParallel256Test.kt   |  18 ++-
+ 3 files changed, 138 insertions(+), 39 deletions(-)
+
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index 258767940..2c9e8b6ab 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -71,6 +71,15 @@ internal class ParallelRangeDataSource(
+         private const val HEDGE_WINDOWS_CDN = 1
+         private const val HEDGE_WINDOWS_USENET = 2
+ 
++        // Stall-ladder endgame: after the adaptive restarts, the floor watchdog
++        // (MemoryBudget.HEDGE_STALL_FLOOR_BPS over 2 consecutive windows) guarantees
++        // liveness — a connection either makes real progress or is killed and
++        // reconnected. The old endgame disabled the watchdog entirely, letting a
++        // ~0 B/s socket hold its gate permit forever: a brownout could leave the
++        // session crawling on a couple of zombie reads that nothing ever reclaimed.
++        private const val STALL_ENDGAME_RESTARTS = 3
++        private const val HEDGE_FLOOR_WINDOWS = 2
++
+         @VisibleForTesting
+         internal var allocateChunk: (Int) -> Allocation? = { DefaultAllocatorNative.createAllocation(it) }
+         @VisibleForTesting
+@@ -175,6 +184,14 @@ internal class ParallelRangeDataSource(
+         private const val CHUNK_RETRY_BASE_DELAY_MS = 50L
+         private const val CHUNK_RETRY_JITTER_MS = 30L
+ 
++        // Aria2-parity brownout ladder: after the fast budget, keep retrying with a
++        // tiered delay (250ms -> 1s + jitter) so a 10-30s carrier brownout is ridden
++        // out by reconnecting, not by failing the chunk and tearing down the whole
++        // session (aria2: --max-tries with --retry-wait, per piece).
++        private const val BROWNOUT_RETRY_BUDGET = 4
++        private val BROWNOUT_RETRY_DELAYS_MS = longArrayOf(250L, 500L, 1_000L, 1_000L)
++        private const val BROWNOUT_RETRY_JITTER_MS = 100L
++
+         private const val RATE_LIMIT_BACKOFF_CYCLE_CAP_MS = 3_000L
+ 
+         private const val RATE_LIMIT_WAIT_HARD_CAP_MS = 15_000L
+@@ -182,7 +199,15 @@ internal class ParallelRangeDataSource(
+         private const val RATE_LIMIT_SLEEP_SLICE_MS = 100L
+ 
+         private const val RATE_LIMIT_DEPTH_STEP_BASE_MS = 10_000L
+-        private const val RATE_LIMIT_DEPTH_STEP_MAX_MS = 60_000L
++        // 20s (was 60s): with the carrier-throttle premise (rate limits are transient
++        // network weather, not sustained server pushback) a minute-long recovery step
++        // held the window near-floor long after the episode ended.
++        private const val RATE_LIMIT_DEPTH_STEP_MAX_MS = 20_000L
++
++        // Fixed 5s gate-recovery cadence, deliberately decoupled from the depth
++        // stepper's doubling: the gate ramps back with multiplicative steps
++        // (MemoryBudget.aimdIncreaseGate), so floor -> full takes ~4 x 5s.
++        private const val GATE_RECOVERY_STEP_MS = 5_000L
+         private const val RATE_LIMIT_ESCALATION_MAX = 5
+ 
+         @Volatile var hudClampLatched: Boolean = false
+@@ -416,15 +441,16 @@ internal class ParallelRangeDataSource(
+             }
+ 
+             /**
+-             * P2: additive recovery of the connection gate ceiling while the session is
+-             * rate-limit quiet. Driven from scheduleChunks (read path), mirroring the
+-             * depth-cap stepping cadence.
++             * P2: multiplicative recovery of the connection gate ceiling while the session
++             * is rate-limit quiet. Driven from scheduleChunks (read path) on a FIXED 5s
++             * cadence — it must not inherit the depth stepper's doubling, or a repeat
++             * episode pushes full-pool recovery out to minutes.
+              */
+             fun recoverGateIfQuiet() {
+                 if (!connectionGate.isThrottled()) return
+                 val now = SystemClock.uptimeMillis()
+-                if (now - lastRateLimitAtMs >= depthStepIntervalMs &&
+-                    now - lastGateStepAtMs >= depthStepIntervalMs) {
++                if (now - lastRateLimitAtMs >= GATE_RECOVERY_STEP_MS &&
++                    now - lastGateStepAtMs >= GATE_RECOVERY_STEP_MS) {
+                     val stepped = connectionGate.recover()
+                     lastGateStepAtMs = now
+                     if (!connectionGate.isThrottled()) {
+@@ -1204,7 +1230,7 @@ internal class ParallelRangeDataSource(
+         sharedExecutor.execute {
+             try {
+                 if (typed.isDone || typed.isCancelled || activeSession.abandoned.get()) return@execute
+-                val result = downloadChunkOnce(activeSession, chunkIndex, typed, allowStallRestart = false)
++                val result = downloadChunkOnce(activeSession, chunkIndex, typed, stallPolicy = StallWatchdog.FLOOR)
+                 if (typed.complete(result)) {
+                     Log.w(TAG, "RS_ESCALATE won chunk=$chunkIndex ms=${SystemClock.elapsedRealtime() - t0}")
+                 } else {
+@@ -1384,7 +1410,8 @@ internal class ParallelRangeDataSource(
+ 
+     private fun downloadChunk(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
+         var lastException: Exception? = null
+-        for (attempt in 0 until CHUNK_RETRY_BUDGET) {
++        val totalBudget = CHUNK_RETRY_BUDGET + BROWNOUT_RETRY_BUDGET
++        for (attempt in 0 until totalBudget) {
+ 
+             if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
+             try {
+@@ -1392,6 +1419,7 @@ internal class ParallelRangeDataSource(
+             } catch (e: Exception) {
+ 
+                 if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
++                if (e is StallLadderExhaustedException) throw e
+                 lastException = e
+ 
+                 if (e is StalledChunkException) {
+@@ -1401,25 +1429,38 @@ internal class ParallelRangeDataSource(
+                 if (rlError != null) {
+                     return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError)
+                 }
+-                if (attempt < CHUNK_RETRY_BUDGET - 1) {
++                if (attempt < totalBudget - 1) {
++                    // Two-tier reconnect ladder: 4 fast attempts (50-80ms) then a
++                    // brownout tier (250ms -> 1s + jitter) that rides out carrier
++                    // weather by reconnecting instead of failing the chunk.
++                    val fastTier = attempt + 1 < CHUNK_RETRY_BUDGET
++                    val delayMs = if (fastTier) {
++                        CHUNK_RETRY_BASE_DELAY_MS + (Math.random() * CHUNK_RETRY_JITTER_MS).toLong()
++                    } else {
++                        BROWNOUT_RETRY_DELAYS_MS[(attempt + 1) - CHUNK_RETRY_BUDGET] +
++                            (Math.random() * BROWNOUT_RETRY_JITTER_MS).toLong()
++                    }
+                     if (e.isTransientInterruption()) {
+                         Log.d(TAG, "Chunk $chunkIndex interrupted during prefetch (attempt ${attempt + 1}), retrying")
+-                    } else {
++                    } else if (fastTier) {
+                         Log.w(TAG, "Chunk $chunkIndex download failed (attempt ${attempt + 1}/$CHUNK_RETRY_BUDGET), retrying: ${e.message}")
++                    } else {
++                        Log.w(TAG, "Chunk $chunkIndex brownout retry " +
++                            "${attempt + 1 - CHUNK_RETRY_BUDGET}/$BROWNOUT_RETRY_BUDGET after ${delayMs}ms: ${e.message}")
+                     }
+                     // Jittered pause: a fixed interval re-syncs workers that failed together
+                     // into a retry herd against the same host.
+                     try {
+-                        Thread.sleep(CHUNK_RETRY_BASE_DELAY_MS + (Math.random() * CHUNK_RETRY_JITTER_MS).toLong())
++                        Thread.sleep(delayMs)
+                     } catch (_: InterruptedException) {
+                     }
+                 }
+             }
+         }
+-        throw IOException("Failed to download chunk $chunkIndex after $CHUNK_RETRY_BUDGET attempts", lastException)
++        throw IOException("Failed to download chunk $chunkIndex after $totalBudget attempts", lastException)
+     }
+ 
+-    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
++    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, stallPolicy: StallWatchdog = StallWatchdog.ADAPTIVE): DownloadedChunk {
+         val chunkStartMs = SystemClock.elapsedRealtime()
+         val sessionLength = activeSession.totalLength
+         val start = chunkIndex * chunkSize
+@@ -1445,7 +1486,7 @@ internal class ParallelRangeDataSource(
+             ds.open(spec)
+ 
+             val expectedBytes = if (sessionLength > 0L) end - start else -1L
+-            val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, allowStallRestart)
++            val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, stallPolicy)
+             // Adaptive hedge bookkeeping: record this chunk's completion rate so the
+             // stall threshold tracks what the line — including any carrier throttle —
+             // actually delivers, instead of a fixed constant.
+@@ -1484,10 +1525,32 @@ internal class ParallelRangeDataSource(
+             }
+         }
+ 
++        // Endgame ladder (aria2 liveness): the floor watchdog reconnects until the
++        // chunk either trickles through at >= the floor rate or the ladder runs out.
++        // The previous endgame disabled the watchdog on the final attempt, letting a
++        // ~0 B/s socket hold its gate permit forever — under a carrier brownout the
++        // session ended up crawling on a couple of zombie reads nothing reclaimed.
++        attempt = 0
++        while (attempt < STALL_ENDGAME_RESTARTS) {
++            if (future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
++            hudHedgeRestarts++
++            Log.w(TAG, "STALL_FLOOR_RESTART chunk=$chunkIndex attempt=${attempt + 1}/$STALL_ENDGAME_RESTARTS " +
++                "prevRateBps=${lastStall.rateBps} floorBps=" +
++                "${com.nuvio.tv.ui.screens.settings.MemoryBudget.HEDGE_STALL_FLOOR_BPS}")
++            try {
++                return downloadChunkOnce(activeSession, chunkIndex, future, stallPolicy = StallWatchdog.FLOOR)
++            } catch (e: Exception) {
++                if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
++                if (e !is StalledChunkException) throw e
++                lastStall = e
++                attempt++
++            }
++        }
++
+         hudHedgeExhausted = true
+-        Log.w(TAG, "HEDGE_RESTART chunk=$chunkIndex exhausted after $HEDGE_MAX_RESTARTS; " +
+-            "final attempt with watchdog disabled")
+-        return downloadChunkOnce(activeSession, chunkIndex, future, allowStallRestart = false)
++        Log.w(TAG, "STALL_FLOOR chunk=$chunkIndex exhausted after " +
++            "${HEDGE_MAX_RESTARTS + STALL_ENDGAME_RESTARTS} restarts; giving up")
++        throw StallLadderExhaustedException(chunkIndex, lastStall)
+     }
+ 
+     private class StalledChunkException(
+@@ -1496,6 +1559,24 @@ internal class ParallelRangeDataSource(
+         val rateBps: Long
+     ) : IOException("chunk $chunkIndex body stalled at ${rateBps}B/s (watermark=$watermark)")
+ 
++    /** Terminal: the whole stall ladder (adaptive + floor watchdog) is exhausted;
++     *  the outer retry ladder must not restart it, only cancel/abandon ends it. */
++    private class StallLadderExhaustedException(
++        chunkIndex: Long,
++        cause: StalledChunkException
++    ) : IOException("chunk $chunkIndex stalled out after " +
++        "${HEDGE_MAX_RESTARTS + STALL_ENDGAME_RESTARTS} restarts " +
++        "(last rate ${cause.rateBps}B/s)", cause)
++
++    /**
++     * Stall watchdog policy per read. ADAPTIVE kills connections that fall four
++     * times behind the session median (the 64-era fixed constant murdered healthy
++     * connections whenever the carrier throttled per-connection throughput). FLOOR
++     * is the liveness backstop: >= 16 KB/s or die — used by the stall-ladder endgame
++     * and the reader escalation, so no read can ever park a permit on a dead socket.
++     */
++    private enum class StallWatchdog { ADAPTIVE, FLOOR }
++
+     private fun Exception.isTransientInterruption(): Boolean {
+         if (this is InterruptedIOException || this is InterruptedException) return true
+         val cause = cause
+@@ -1591,7 +1672,7 @@ internal class ParallelRangeDataSource(
+         ds: DataSource,
+         future: CompletableFuture<*>,
+         expectedBytes: Long,
+-        allowStallRestart: Boolean = true
++        stallPolicy: StallWatchdog = StallWatchdog.ADAPTIVE
+     ): DownloadedChunk {
+         val buffer = acquireBuffer()
+ 
+@@ -1612,25 +1693,34 @@ internal class ParallelRangeDataSource(
+         var hedgeLastCheckBytes = 0
+ 
+         val hedgeIsUsenet = activeSession.resolvedUri?.path?.contains("/usenet/") == true
+-        // Adaptive stall threshold: the fixed 256 KB/s (2 Mbps) CDN constant killed
+-        // healthy connections whenever the carrier throttled per-connection throughput
+-        // below it — each kill costing a fresh TCP slow start and a TIME_WAIT socket.
+-        // The threshold now tracks a quarter of the session's median chunk rate,
+-        // floored at 16 KB/s, so only genuine stalls (no progress at all, or four
+-        // times slower than the session median) are restarted. Until samples exist
+-        // the legacy constants keep first-chunk behaviour unchanged.
+-        val hedgeStallRateBps = if (hedgeIsUsenet) {
+-            com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
++        // Stall policy: ADAPTIVE tracks a quarter of the session's median chunk rate
++        // (floored at 16 KB/s), so only genuine stalls — no progress at all, or four
++        // times slower than the session median — are restarted; the 64-era fixed
++        // constant killed healthy connections whenever the carrier throttled
++        // per-connection throughput below it, each kill costing a fresh TCP slow
++        // start and a TIME_WAIT socket. FLOOR is the liveness backstop used by the
++        // stall-ladder endgame and the reader escalation: >= 16 KB/s over 2
++        // consecutive windows or the read dies and reconnects. It is deliberately
++        // exempt from the 429 clamp latch — parking a permit on a dead socket is
++        // never the lesser evil.
++        val hedgeStallRateBps: Long
++        val hedgeWindowsRequired: Int
++        if (stallPolicy == StallWatchdog.FLOOR) {
++            hedgeStallRateBps = com.nuvio.tv.ui.screens.settings.MemoryBudget.HEDGE_STALL_FLOOR_BPS
++            hedgeWindowsRequired = HEDGE_FLOOR_WINDOWS
++        } else if (hedgeIsUsenet) {
++            hedgeStallRateBps = com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
+                 activeSession.completedChunkRatesBps.toList(),
+                 HEDGE_STALL_RATE_USENET
+             )
++            hedgeWindowsRequired = HEDGE_WINDOWS_USENET
+         } else {
+-            com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
++            hedgeStallRateBps = com.nuvio.tv.ui.screens.settings.MemoryBudget.hedgeStallThresholdBps(
+                 activeSession.completedChunkRatesBps.toList(),
+                 HEDGE_STALL_RATE_CDN
+             )
++            hedgeWindowsRequired = HEDGE_WINDOWS_CDN
+         }
+-        val hedgeWindowsRequired = if (hedgeIsUsenet) HEDGE_WINDOWS_USENET else HEDGE_WINDOWS_CDN
+         var hedgeConsecutiveStalled = 0
+         try {
+             val byteBufferReader = if (useNativeMemory && ds is androidx.media3.common.ByteBufferDataReader && ds.supportsByteBufferRead()) {
+@@ -1691,9 +1781,9 @@ internal class ParallelRangeDataSource(
+                         "stalled=$hedgeStalled " +
+                         "consec=$hedgeConsecutiveStalled/$hedgeWindowsRequired " +
+                         "usenet=$hedgeIsUsenet clamp=$hudClampLatched " +
+-                        "restartable=$allowStallRestart")
++                        "policy=$stallPolicy")
+                     if (hedgeConsecutiveStalled >= hedgeWindowsRequired &&
+-                        allowStallRestart && !hudClampLatched) {
++                        (stallPolicy == StallWatchdog.FLOOR || !hudClampLatched)) {
+ 
+                         throw StalledChunkException(chunkIndex, totalRead, hedgeRateBps)
+                     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+index 5db5d1a98..03352b0aa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MemoryBudget.kt
+@@ -281,9 +281,12 @@ object MemoryBudget {
+     fun aimdDecreaseGate(ceiling: Int, connections: Int): Int =
+         (ceiling / 2).coerceAtLeast(aimdGateFloor(connections))
+ 
+-    /** Additive increase: +1/16 of the configured count per quiet step, capped at it. */
++    /** Multiplicative increase: double the ceiling per quiet step (min step 1/16 of
++     *  the configured count), capped at it. Full recovery from the aimdGateFloor
++     *  takes log2 steps — 4 steps at the 256 tier — so a rate-limit episode costs
++     *  seconds, not the minutes the +1/16 stepper needed. */
+     fun aimdIncreaseGate(ceiling: Int, connections: Int): Int =
+-        (ceiling + (connections / 16).coerceAtLeast(1)).coerceAtMost(connections)
++        (ceiling + maxOf(ceiling, connections / 16)).coerceAtMost(connections)
+ 
+     /**
+      * Depth-cap floor during 429 episodes. The window may shrink under load but never
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+index 6ce66de55..b42092432 100644
+--- a/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/settings/MemoryBudgetParallel256Test.kt
+@@ -191,14 +191,20 @@ class MemoryBudgetParallel256Test {
+     }
+ 
+     @Test
+-    fun testAimdIncreaseRecoversProportionally() {
+-        // +1/16 of the configured count per quiet step, capped at it: full recovery
+-        // from the 256-tier floor takes 15 steps, not the 240 single steps (+1 each,
+-        // 10-60 s apart) the 64-era depth stepper needed.
++    fun testAimdIncreaseDoublesPerQuietStep() {
++        // Multiplicative recovery: the ceiling doubles per quiet step (min step
++        // 1/16 of the configured count), capped at it — full recovery from the
++        // 256-tier floor takes 4 steps (~20s at the fixed 5s gate cadence), not
++        // the 15 additive steps the +1/16 stepper needed at 10-60s apart, and
++        // certainly not the 240 (+1 each) the 64-era stepper needed.
+         assertEquals(32, MemoryBudget.aimdIncreaseGate(16, 256))
++        assertEquals(64, MemoryBudget.aimdIncreaseGate(32, 256))
++        assertEquals(256, MemoryBudget.aimdIncreaseGate(128, 256))
+         assertEquals(256, MemoryBudget.aimdIncreaseGate(240, 256))
+         assertEquals(256, MemoryBudget.aimdIncreaseGate(256, 256))
+-        assertEquals(12, MemoryBudget.aimdIncreaseGate(8, 64))
++        // Min step: ceilings below N/16 still advance by N/16, never stall.
++        assertEquals(24, MemoryBudget.aimdIncreaseGate(8, 256))
++        assertEquals(16, MemoryBudget.aimdIncreaseGate(8, 64))
+         var ceiling = 16
+         var steps = 0
+         while (ceiling < 256 && steps < 32) {
+@@ -206,7 +212,7 @@ class MemoryBudgetParallel256Test {
+             steps++
+         }
+         assertEquals(256, ceiling)
+-        assertTrue(steps in 1..16)
++        assertTrue(steps in 1..8)
+     }
+ 
+     @Test
 -- 
 2.47.3
 
